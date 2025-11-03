@@ -1,0 +1,17 @@
+## Interface: 110100
+## Title: What's Left? (Legion Remix)
+## Notes: Hides known appearances, toys, pets, and mounts; tracks totals and progression; lightweight UI.
+## Author: Gunner
+## Version: 1.1.0
+## SavedVariables: VKF_LastSeenVersion, VKF_FilterBehavior, VKF_ShowTotals, VKF_MenuPanelState, VKF_TotalsState
+## IconTexture: Interface\AddOns\WhatsLeft\media\icon
+## X-Category: Inventory
+## X-Website: https:x.com/wheresmeep
+## X-Discord: Gunner.4
+## X-Credits: Built by Gunner / Meep. Thanks to testers!
+## X-Localizations: enUS
+
+## SavedVariables: VKF_MenuPanelState, VKF_TotalsState, VKF_HideSets, VKF_HideMounts, VKF_HidePets, VKF_HideToys, VKF_SkipUnavail_Sets, VKF_SkipUnavail_Mounts, VKF_SkipUnavail_Pets, VKF_SkipUnavail_Toys
+## SavedVariablesPerCharacter:
+
+WhatsLeft.lua
