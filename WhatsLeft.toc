@@ -1,20 +1,31 @@
 ## Interface: 110100
 ## Title: What's Left? (Legion Remix)
 ## Notes: Hides known appearances, toys, pets, and mounts; tracks totals and progression; lightweight UI.
+## Notes-ruRU: Скрывает известные облиki, игрушки, питомцев и транспорт; отслеживает общее количество и прогресс; легкий интерфейс.
 ## Notes-zhCN: 隐藏已知外观、玩具、宠物和坐骑；统计总额与进度；轻量 UI。
 ## Notes-zhTW: 隱藏已知外觀、玩具、寵物與坐騎；統計總額與進度；輕量 UI。
+## Notes-deDE: Versteckt bekannte Vorlagen, Spielzeuge, Haustiere und Reittiere; verfolgt Gesamtzahlen und Fortschritt; leichtgewichtiges UI.
+## Notes-esES: Oculta apariencias, juguetes, mascotas y monturas conocidas; rastrea totales y progreso; interfaz ligera.
+## Notes-esMX: Oculta apariencias, juguetes, mascotas y monturas conocidas; rastrea totales y progreso; interfaz ligera.
+## Notes-frFR: Cache les apparences, jouets, mascottes et montures connues ; suit les totaux et la progression ; interface légère.
+## Notes-itIT: Nasconde aspetto, giocattoli, mascotte e cavalcature conosciuti; tiene traccia dei totali e dei progressi; interfaccia leggera.
+## Notes-koKR: 이미 배운 형상, 장난감, 애완동물, 탈것을 숨깁니다; 총합과 진행도를 추적합니다; 가벼운 UI입니다.
+## Notes-ptBR: Oculta aparências, brinquedos, mascotes e montarias conhecidas; rastreia totais e progresso; interface leve.
+
 ## Author: Gunner
-## Version: 1.1.0
+## Version: 1.3.0
 ## SavedVariables: VKF_LastSeenVersion, VKF_FilterBehavior, VKF_ShowTotals, VKF_MenuPanelState, VKF_TotalsState
 ## IconTexture: Interface\AddOns\WhatsLeft\media\icon
 ## X-Category: Inventory
 ## X-Website: https:x.com/wheresmeep
 ## X-Discord: Gunner.4
 ## X-Credits: Built by Gunner / Meep. Thanks to testers!
-## X-Localizations: enUS, zhCN, zhTW
+## X-Localizations: enUS,ruRU, zhCN, zhTW, deDE, esES, esMX, frFR, itIT, koKR, ptBR, 
 
-## SavedVariables: VKF_MenuPanelState, VKF_TotalsState, VKF_HideSets, VKF_HideMounts, VKF_HidePets, VKF_HideToys, VKF_SkipUnavail_Sets, VKF_SkipUnavail_Mounts, VKF_SkipUnavail_Pets, VKF_SkipUnavail_Toys
+## SavedVariables: VKF_MenuPanelState, VKF_TotalsState, VKF_HideSets, VKF_HideMounts, VKF_HidePets, VKF_HideToys, VKF_SkipUnavail_Sets, VKF_SkipUnavail_Mounts, VKF_SkipUnavail_Pets, VKF_SkipUnavail_Toys, VKF_Settings, VKF_MenuPanelState, VKF_TotalsState, VKF_TotalsEnabled
 ## SavedVariablesPerCharacter:
 
 localization.lua
+WhatsLeft_ItemMetaDB.lua
 WhatsLeft.lua
+WhatsLeft_Settings.lua

@@ -1,8 +1,10 @@
--- HideKnownAppearances.lua
+-- WhatsLeft.lua
 local ADDON = ...
 
 -- Initialize localization
 local LOC = GetLocaleTable()
+
+
 
 ----------------------------------------------------------------
 -- PERSISTED UI STATE (init first; do NOT touch frames here)
@@ -12,6 +14,22 @@ _G.VKF_MenuPanelState = VKF_MenuPanelState
 
 VKF_TotalsState = _G.VKF_TotalsState or { h = 56, yOff = -2 }
 _G.VKF_TotalsState = VKF_TotalsState
+
+-- === PERSISTED SETTINGS ===
+VKF_Settings = _G.VKF_Settings or { uiScale = 1.00 }
+_G.VKF_Settings = VKF_Settings
+
+
+
+-- === Apply scale to WL panels (call anytime after panels exist) ===
+function VKF_ApplyScale()
+  local s = tonumber(VKF_Settings.uiScale) or 1.00
+  if s < 0.80 then s = 0.80 elseif s > 1.40 then s = 1.40 end
+  if _G.VKF_MenuPanel   and VKF_MenuPanel.SetScale   then VKF_MenuPanel:SetScale(s) end
+  if _G.VKF_TotalsPanel and VKF_TotalsPanel.SetScale then VKF_TotalsPanel:SetScale(s) end
+  if _G.VKF_MiniPanel   and VKF_MiniPanel.SetScale   then VKF_MiniPanel:SetScale(s) end
+end
+
 
 ----------------------------------------------------------------
 -- ROOT CONTROLLER
@@ -24,6 +42,8 @@ _G.WL_Core = WL
 -- Drop-in patch. Keeps your existing filtering logic; only manages hooks, events, and throttled rescans.
 
 
+local VKF_TooltipCache = {}
+
 -- --------------- Configurable timing ---------------
 local RESCAN_SOFT_DELAY  = 0.05  -- fast follow-up after UI paint
 local RESCAN_HARD_DELAY  = 0.30  -- safety pass after merchant data settles
@@ -35,10 +55,12 @@ WL._debounceHandle = nil
 WL._lastRescanAt   = 0
 WL._merchantOpen   = false
 
+
 -- Utility: ms clock
 local function nowMs()
   return GetTime() * 1000
 end
+
 
 -- Debounce helper
 local function debounced(fn, waitMs)
@@ -66,50 +88,33 @@ local function EnsureHooks()
   end)
 
   -- Some UIs call this older path; harmless to hook as well.
-  if MerchantFrame_Update then
-    hooksecurefunc("MerchantFrame_Update", function()
-      WL:RescanThrottled("MerchantFrame_Update")
-    end)
-  end
+  ---if MerchantFrame_Update then
+    ---hooksecurefunc("MerchantFrame_Update", function()
+      ---WL:RescanThrottled("MerchantFrame_Update")
+    ---end)
+  ---end
 end
 
 -- Core: Do the actual work (call your existing row-filter function here)
 function WL:RescanNow(reason)
+  if not WL_Enabled then
+    return
+  end
   if not WL._merchantOpen or not MerchantFrame or not MerchantFrame:IsShown() then
     return
   end
 
-  local n = GetMerchantNumItems() or 0
-  if n <= 0 then
-    -- Try a delayed pass when the list is still populating
-    C_Timer.After(RESCAN_SOFT_DELAY, function() WL:RescanNow("soft-wait") end)
-    return
+  -- Single central refresh path
+  if HKA and HKA.Refresh then
+    HKA:Refresh()
   end
-
-  -- PASS 1: immediate pass after the triggering event
-  for i = 1, n do
-    -- 🔧 Replace the call below with YOUR filtering function:
-    -- e.g., WhatsLeft_ApplyFiltersToMerchantRow(i)
-    if WhatsLeft_ApplyFiltersToMerchantRow then
-      pcall(WhatsLeft_ApplyFiltersToMerchantRow, i)
-    end
-  end
-
-  -- PASS 2: safety pass a bit later (covers async icon/currency/state)
-  C_Timer.After(RESCAN_HARD_DELAY, function()
-    local m = GetMerchantNumItems() or 0
-    for j = 1, m do
-      if WhatsLeft_ApplyFiltersToMerchantRow then
-        pcall(WhatsLeft_ApplyFiltersToMerchantRow, j)
-      end
-    end
-  end)
 
   WL._lastRescanAt = nowMs()
 end
 
 -- Throttled wrapper (collapses bursts of events)
 WL.RescanThrottled = debounced(function(reason)
+  if not WL_Enabled then return end
   WL:RescanNow(reason)
 end, RESCAN_DEBOUNCE_MS)
 
@@ -124,32 +129,42 @@ WL:SetScript("OnEvent", function(self, event, ...)
   elseif event == "PLAYER_LOGIN" then
     EnsureHooks()
 
-  elseif event == "MERCHANT_SHOW" then
-    WL._merchantOpen = true
-    EnsureHooks()
-    -- Run a couple of passes as UI settles
-    C_Timer.After(0.01, function() WL:RescanNow("MERCHANT_SHOW+10ms") end)
-    C_Timer.After(0.20, function() WL:RescanNow("MERCHANT_SHOW+200ms") end)
+elseif event == "MERCHANT_SHOW" then
+  WL._merchantOpen = true
+  VKF_ClearSlotMeta()
+  EnsureHooks()
 
-  elseif event == "MERCHANT_UPDATE" then
-    WL:RescanThrottled("MERCHANT_UPDATE")
+  -- start timing to see delay effect
+  local openT = debugprofilestop()
 
-  elseif event == "MERCHANT_CLOSED" then
+  -- Do a delayed first pass (to avoid open-frame hitch)
+  C_Timer.After(0.15, function()
+    if WL._merchantOpen then
+      local t0 = debugprofilestop()
+      WL:RescanNow("MERCHANT_SHOW")
+      local t1 = debugprofilestop()
+    end
+  end)
+
+elseif event == "MERCHANT_CLOSED" then
     WL._merchantOpen = false
+    VKF_ClearSlotMeta()
     if WL._debounceHandle then
       WL._debounceHandle:Cancel()
       WL._debounceHandle = nil
     end
-
+	
   -- Currency changes (Legion/MoP Remix bronze, etc.) can alter affordability/visibility
   elseif event == "CURRENCY_DISPLAY_UPDATE" or event == "PLAYER_MONEY" then
     if WL._merchantOpen then
+      VKF_ClearSlotMeta()
       WL:RescanThrottled(event)
     end
 
   -- Bag changes (reagents, mats, or quest-item requirements sometimes affect UI logic)
   elseif event == "BAG_UPDATE_DELAYED" then
     if WL._merchantOpen then
+      VKF_ClearSlotMeta()
       WL:RescanThrottled("BAG_UPDATE_DELAYED")
     end
   end
@@ -174,6 +189,7 @@ HKA:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 HKA:RegisterEvent("ZONE_CHANGED")
 
 HKA:SetScript("OnEvent", function(self, event)
+
   -- Handle zone transitions and dungeon exits
   if event == "PLAYER_ENTERING_WORLD"
   or event == "ZONE_CHANGED"
@@ -198,12 +214,10 @@ HKA:SetScript("OnEvent", function(self, event)
     if self.needsRefresh then
       self.needsRefresh = false
     end
-    if HKA.Refresh then
-      HKA:Refresh()
-    end
+    -- WL / RescanThrottled will drive the actual refresh.
+    return
   end
- end)
-
+end)
 ----------------------------------------------------------------
 -- SESSION TOGGLES (defaults: all OFF unless explicitly saved)
 ----------------------------------------------------------------
@@ -221,9 +235,16 @@ VKF_SkipUnavail_Sets   = on(VKF_SkipUnavail_Sets)
 VKF_SkipUnavail_Mounts = on(VKF_SkipUnavail_Mounts)
 VKF_SkipUnavail_Pets   = on(VKF_SkipUnavail_Pets)
 
+if type(VKF_TotalsEnabled) ~= "boolean" then
+  VKF_TotalsEnabled = true
+end
+
+WL_Enabled = WL_Enabled or false
 ----------------------------------------------------------------
 -- HELPERS
 ----------------------------------------------------------------
+
+
 
 -- Validates merchant slot is real & ready
 local function VKF_IsValidSlot(slot)
@@ -348,6 +369,77 @@ local function PatchPopup(which)
   end
 end
 
+-- === SETTINGS WINDOW ===
+local function VKF_ShowSettings()
+  if _G.VKF_SettingsFrame then
+    VKF_SettingsFrame:Show()
+    return
+  end
+
+  local f = CreateFrame("Frame", "VKF_SettingsFrame", UIParent, "BackdropTemplate")
+  f:SetSize(320, 150)
+  f:SetFrameStrata("DIALOG")
+  f:SetClampedToScreen(true)
+  f:SetPoint("CENTER")
+  f:SetBackdrop({
+    bgFile="Interface/Tooltips/UI-Tooltip-Background",
+    edgeFile="Interface/Tooltips/UI-Tooltip-Border",
+    tile=true, tileSize=16, edgeSize=12,
+    insets={left=4,right=4,top=4,bottom=4}
+  })
+  f:SetBackdropColor(0,0,0,0.92)
+  f:SetBackdropBorderColor(0,0,0,1)
+
+  -- Title
+  local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  title:SetPoint("TOPLEFT", 10, -10)
+  title:SetText("What’s Left?  Settings")
+
+  -- Close button
+  local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", 0, 0)
+
+  -- Scale slider
+  local slider = CreateFrame("Slider", "$parentScale", f, "OptionsSliderTemplate")
+  slider:SetPoint("TOPLEFT", 16, -48)
+  slider:SetWidth(288)
+  slider:SetMinMaxValues(0.80, 1.40)
+  slider:SetValueStep(0.05)
+  slider:SetObeyStepOnDrag(true)
+
+  -- Label text
+  _G[slider:GetName() .. "Low"]:SetText("0.80")
+  _G[slider:GetName() .. "High"]:SetText("1.40")
+  _G[slider:GetName() .. "Text"]:SetText(("UI Scale: %.2f"):format(VKF_Settings.uiScale or 1.00))
+
+  slider:SetScript("OnValueChanged", function(self, val)
+    VKF_Settings.uiScale = tonumber(string.format("%.2f", val))
+    _G[self:GetName() .. "Text"]:SetText(("UI Scale: %.2f"):format(VKF_Settings.uiScale))
+    VKF_ApplyScale()
+  end)
+
+  slider:SetValue(VKF_Settings.uiScale or 1.00)
+
+  -- ESC to close
+  f:SetPropagateKeyboardInput(true)
+  f:EnableKeyboard(true)
+  f:SetScript("OnKeyDown", function(self, key)
+    if key == "ESCAPE" then self:Hide() end
+  end)
+end
+
+function VKF_ToggleSettings()
+  if _G.VKF_SettingsFrame and VKF_SettingsFrame:IsShown() then
+    VKF_SettingsFrame:Hide()
+  else
+    VKF_ShowSettings()
+  end
+end
+
+-- Optional slash: /wlsettings
+SLASH_WLSETTINGS1 = "/wlsettings"
+SlashCmdList.WLSETTINGS = function() VKF_ToggleSettings() end
+
 -- ---------- Safe "already known" tooltip checker (global) ----------
 if type(_G.TooltipHasAlreadyKnown) ~= "function" then
   function TooltipHasAlreadyKnown(slot)
@@ -377,6 +469,11 @@ end
 
 -- True if the tooltip has WORD 'wordLC' (case-insensitive) with word boundaries
 local function TooltipContainsWordLower(slot, wordLC)
+local link = GetMerchantItemLink(slot)
+if link and VKF_TooltipCache[link] then
+  local text = VKF_TooltipCache[link]
+  return text:find(wordLC, 1, true)
+end
   scanner:ClearLines()
   scanner:SetMerchantItem(slot)
   local pat = "%f[%w]" .. _vkf_pat_escape(string.lower(wordLC)) .. "%f[%W]"
@@ -413,6 +510,36 @@ local function TooltipHasCollected(slot)
     local a2,b2 = extract(R); if a2 and a2 > 0 then return true end
   end
   return false
+end
+
+-- Parse "Collected (x/y)" from the vendor tooltip for this slot.
+local function WL_ParseCollectedProgressFromTooltip(slot)
+  if not VKF_SafeScannerSetMerchantItem(slot) then return nil, nil end
+  local c, t
+  VKF_ScannerEachLine(function(L, R)
+    local function grab(fs)
+      local s = _vkf_sanitize_lower(fs and fs:GetText()); if not s then return end
+      -- Try every localized pattern
+      for _, pat in ipairs((LOC and LOC.COLLECTED_PROGRESS_PATTERNS) or { "collected%s*%((%d+)%s*/%s*(%d+)%)" }) do
+        local a, b = s:match(pat)
+        if a and b then c, t = tonumber(a), tonumber(b); return end
+      end
+    end
+    if not c then grab(L) end
+    if not c then grab(R) end
+  end)
+  return c, t
+end
+
+-- Goal rule: singles (1/1) are always “at goal”; 3-cap pets must equal the goal.
+local function WL_ShouldHidePetByGoal(collected, total, goal)
+  if not collected or not total or not goal then return false end
+  if total <= 1 then
+    -- 1-cap (only one copy exists)
+    return collected >= 1
+  end
+  -- 3-cap (battle pets)
+  return (total >= 3) and (collected == goal)
 end
 
 
@@ -682,6 +809,8 @@ local function ItemTeachesToy(slot, link)
   return nil
 end
 
+
+
 -- Returns true if the toy is already collected.
 local function IsToyKnown(slot, link)
   if not link then return false end
@@ -704,10 +833,9 @@ local function IsToyKnown(slot, link)
 end
 
 
-
 -- Mounts: strong detection (API first, then tooltip with the word "mount")
 local function DetectMount(slot, link)
-if not GetMerchantItemInfo(slot) then return false end
+  if not GetMerchantItemInfo(slot) then return false end
   if not link then return false end
 
   -- API paths
@@ -724,8 +852,11 @@ if not GetMerchantItemInfo(slot) then return false end
     end
   end
 
-  -- Tooltip fallback: require the word "mount" but exclude toys
-  if slot and TooltipContainsAnyToken(slot, LOC.MOUNT_TOKENS) and not TooltipContainsAnyToken(slot, LOC.TOY_TOKENS) then
+  -- Tooltip fallback: require the word "mount" but exclude toys and appearances
+  if slot 
+     and TooltipContainsAnyToken(slot, LOC.MOUNT_TOKENS)
+     and not TooltipContainsAnyToken(slot, LOC.TOY_TOKENS)
+     and not TooltipContainsAnyToken(slot, LOC.APPEARANCE_TOKENS) then
     return true
   end
 
@@ -774,51 +905,256 @@ if not GetMerchantItemInfo(slot) then return false end
   return false
 end
 
+----------------------------------------------------------------
+-- SLOT META CACHE (cut down tooltip passes)
+----------------------------------------------------------------
+local VKF_SlotMeta = {}
+
+ function VKF_ClearSlotMeta()
+  wipe(VKF_SlotMeta)
+end
+
+-- Returns a table:
+-- {
+--   link              = itemLink or nil,
+--   isSet             = bool,
+--   isMount           = bool,
+--   isPet             = bool,
+--   isToy             = bool,
+--   isTempUnavailable = bool,
+--   isKnownSet        = bool,
+--   isKnownMount      = bool,
+--   isKnownPet        = bool,
+--   isKnownToy        = bool,
+-- }
+
+
+local function GetTooltipTextLower(slot, link)
+  if not link then return "" end
+
+  -- Return cached tooltip text if we have it
+  local cached = VKF_TooltipCache[link]
+  if cached then
+    return cached.lower
+  end
+
+  -- Build once
+  local TT = VKF_ScanTip or CreateFrame("GameTooltip", "VKF_ScanTip", nil, "GameTooltipTemplate")
+  VKF_ScanTip = TT
+  TT:SetOwner(UIParent, "ANCHOR_NONE")
+  TT:ClearLines()
+  TT:SetMerchantItem(slot)
+
+  local text = {}
+  for i = 1, TT:NumLines() do
+    local line = _G["VKF_ScanTipTextLeft"..i]
+    if line then
+      local t = line:GetText()
+      if t and t ~= "" then
+        text[#text+1] = t
+      end
+    end
+  end
+
+  local lower = string.lower(table.concat(text, " "))
+  VKF_TooltipCache[link] = { lower = lower }
+  return lower
+end
+
+------------------------------------------------------------
+-- CACHED SLOT META  (uses WL_ItemMetaDB when available)
+------------------------------------------------------------
+local function VKF_GetSlotMeta(slot)
+  -- Per-slot cache: if we've already classified this merchant slot, reuse it.
+  local cached = VKF_SlotMeta[slot]
+  if cached ~= nil then
+    return cached
+  end
+
+  -- Default/empty meta
+  local info = {
+    link              = nil,
+    isSet             = false,
+    isMount           = false,
+    isPet             = false,
+    isToy             = false,
+    isTempUnavailable = false,
+    isKnownSet        = false,
+    isKnownMount      = false,
+    isKnownPet        = false,
+    isKnownToy        = false,
+  }
+
+if not VKF_IsValidSlot(slot) then
+  -- Invalid merchant slot; return a blank meta but don't cache
+  return {
+    link = nil,
+    isSet = false,
+    isMount = false,
+    isPet = false,
+    isToy = false,
+    isTempUnavailable = false,
+    isKnownSet = false,
+    isKnownMount = false,
+    isKnownPet = false,
+    isKnownToy = false,
+  }
+end
+
+local link = GetMerchantItemLink(slot)
+if not link then
+  -- Slot not fully loaded yet — skip caching this one so it can refresh later
+  return {
+    link = nil,
+    isSet = false,
+    isMount = false,
+    isPet = false,
+    isToy = false,
+    isTempUnavailable = false,
+    isKnownSet = false,
+    isKnownMount = false,
+    isKnownPet = false,
+    isKnownToy = false,
+  }
+end
+
+-- At this point we know the slot and link are valid
+info.link = link
+  ------------------------------------------------------------
+  -- Ensure global item meta DB exists
+  ------------------------------------------------------------
+  WL_ItemMetaDB = WL_ItemMetaDB or {}
+
+  local itemID = GetItemInfoInstant(link)
+  local db = itemID and WL_ItemMetaDB[itemID] or nil
+
+  ------------------------------------------------------------
+  -- 1) Classification: use DB if present, otherwise detect once
+  ------------------------------------------------------------
+  if db then
+    -- Only the type flags (cheap, static per itemID)
+    info.isSet   = not not db.isSet
+    info.isMount = not not db.isMount
+    info.isPet   = not not db.isPet
+    info.isToy   = not not db.isToy
+  else
+    -- Expensive detection path (run once per unknown itemID)
+    if DetectMount(slot, link) then
+      info.isMount = true
+    elseif DetectPet(slot, link) then
+      info.isPet = true
+    elseif DetectToy(slot, link) then
+      info.isToy = true
+    elseif IsEnsemble(link, slot) then
+      info.isSet = true
+    end
+
+    -- Seed DB entry for this itemID so we never redo classification
+    if itemID then
+      db = {
+        isSet   = info.isSet,
+        isMount = info.isMount,
+        isPet   = info.isPet,
+        isToy   = info.isToy,
+      }
+      WL_ItemMetaDB[itemID] = db
+    end
+  end
+
+------------------------------------------------------------
+  -- 2) Known/unavailable: recompute dynamic known states every scan
+  ------------------------------------------------------------
+  if info.isMount then
+    local known = IsMountKnown(link)
+    info.isKnownMount = known
+    if db then db.isKnownMount = known end
+  end
+
+  if info.isPet then
+    local known = IsPetKnown(slot, link)
+    info.isKnownPet = known
+    if db then db.isKnownPet = known end
+  end
+
+  if info.isToy then
+    local known = IsToyKnown(slot, link)
+    info.isKnownToy = known
+    if db then db.isKnownToy = known end
+  end
+
+  if info.isSet then
+    local known = IsKnownSet(slot, link)
+    info.isKnownSet = known
+    if db then db.isKnownSet = known end
+  end
+
+  if db then
+    if db.isTempUnavailable == nil then
+      db.isTempUnavailable = TooltipIsTemporarilyUnavailable(slot)
+    end
+    info.isTempUnavailable = db.isTempUnavailable or false
+  else
+    info.isTempUnavailable = TooltipIsTemporarilyUnavailable(slot)
+  end
+
+  ------------------------------------------------------------
+  -- 3) Per-slot cache
+  ------------------------------------------------------------
+  VKF_SlotMeta[slot] = info
+  return info
+end
+
 
 ----------------------------------------------------------------
 -- FILTER (gapless list)
 ----------------------------------------------------------------
+----------------------------------------------------------------
+-- FILTER (gapless list) – now uses VKF_GetSlotMeta
+----------------------------------------------------------------
 local function BuildFilteredSlots()
   local out, total = {}, GetMerchantNumItems()
   for slot = 1, total do
-    local link = GetMerchantItemLink(slot)
+    local info = VKF_GetSlotMeta(slot)
+    local link = info.link
     local hide = false
+
     if not link then
+      -- keep "empty" slots so paging works
       table.insert(out, slot)
     else
-      ---------------------------------------------------------
-      -- Detect item type first (each slot belongs to one type)
-      ---------------------------------------------------------
-      local isMount = DetectMount(slot, link)
-      local isPet   = (not isMount) and DetectPet(slot, link) or false
-      local isToy   = (not isMount and not isPet) and DetectToy(slot, link) or false
-      local isSet   = (not isMount and not isPet and not isToy) and IsEnsemble(link) or false
+      local isSet   = info.isSet
+      local isMount = info.isMount
+      local isPet   = info.isPet
+      local isToy   = info.isToy
 
       ---------------------------------------------------------
       -- Apply per-category rules (independent toggles)
       ---------------------------------------------------------
       if isSet then
-        if VKF_HideSets and IsKnownSet(slot, link) then
+        if VKF_HideSets and info.isKnownSet then
           hide = true
-        elseif VKF_SkipUnavail_Sets and TooltipIsTemporarilyUnavailable(slot) then
+        elseif VKF_SkipUnavail_Sets and info.isTempUnavailable then
           hide = true
         end
+
       elseif isMount then
-        if VKF_HideMounts and IsMountKnown(link) then
+        if VKF_HideMounts and info.isKnownMount then
           hide = true
-        elseif VKF_SkipUnavail_Mounts and TooltipIsTemporarilyUnavailable(slot) then
+        elseif VKF_SkipUnavail_Mounts and info.isTempUnavailable then
           hide = true
         end
+
       elseif isPet then
-        if VKF_HidePets and IsPetKnown(slot, link) then
+        if VKF_HidePets and info.isKnownPet then
           hide = true
-        elseif VKF_SkipUnavail_Pets and TooltipIsTemporarilyUnavailable(slot) then
+        elseif VKF_SkipUnavail_Pets and info.isTempUnavailable then
           hide = true
         end
+
       elseif isToy then
-        if VKF_HideToys and IsToyKnown(slot, link) then
+        if VKF_HideToys and info.isKnownToy then
           hide = true
-        elseif VKF_SkipUnavail_Toys and TooltipIsTemporarilyUnavailable(slot) then
+        elseif VKF_SkipUnavail_Toys and info.isTempUnavailable then
           hide = true
         end
       end
@@ -919,6 +1255,7 @@ if type(VKF_ToggleMini) ~= "function" then
 
 -- --- Internal: compute category breakdown for the current vendor page ---
 -- --- Internal: compute category breakdown for the current vendor page (incl. Sets)
+-- --- Internal: compute category breakdown for the current vendor page (incl. Sets)
 local function VKF_BuildCategoryBreakdown()
   local out = {
     sets   = { total = 0, known = 0, count = 0 },
@@ -956,15 +1293,15 @@ local function VKF_BuildCategoryBreakdown()
 
   local totalSlots = GetMerchantNumItems() or 0
   for slot = 1, totalSlots do
-    local link = GetMerchantItemLink(slot)
+    local info = VKF_GetSlotMeta(slot)
+    local link = info.link
     if link then
       local b = bronzeCost(slot) or 0
 
-      -- Classify once, in strict order to avoid overlaps
-      local isMount = DetectMount(slot, link)
-      local isPet   = (not isMount) and DetectPet(slot, link) or false
-      local isToy   = (not isMount and not isPet) and DetectToy(slot, link) or false
-      local isSet   = (not isMount and not isPet and not isToy) and IsEnsemble(link) or false
+      local isSet   = info.isSet
+      local isMount = info.isMount
+      local isPet   = info.isPet
+      local isToy   = info.isToy
 
       local any, known = false, false
 
@@ -972,31 +1309,34 @@ local function VKF_BuildCategoryBreakdown()
         any = true
         out.sets.total = out.sets.total + b
         out.sets.count = out.sets.count + 1
-        if IsKnownSet(slot, link) then
+        if info.isKnownSet then
           out.sets.known = out.sets.known + b
           known = true
         end
+
       elseif isMount then
         any = true
         out.mounts.total = out.mounts.total + b
         out.mounts.count = out.mounts.count + 1
-        if IsMountKnown(link) then
+        if info.isKnownMount then
           out.mounts.known = out.mounts.known + b
           known = true
         end
+
       elseif isPet then
         any = true
         out.pets.total = out.pets.total + b
         out.pets.count = out.pets.count + 1
-        if IsPetKnown(slot, link) then
+        if info.isKnownPet then
           out.pets.known = out.pets.known + b
           known = true
         end
+
       elseif isToy then
         any = true
         out.toys.total = out.toys.total + b
         out.toys.count = out.toys.count + 1
-        if IsToyKnown(slot, link) then
+        if info.isKnownToy then
           out.toys.known = out.toys.known + b
           known = true
         end
@@ -1057,56 +1397,63 @@ end
 
 
 
-  function VKF_EnsureMiniPanel(anchorFrame)
-    if VKF_MiniPanel then return end
-    local f = CreateFrame("Frame", "VKF_HKA_Mini", UIParent, "BackdropTemplate")
-    VKF_MiniPanel = f
-	_G.VKF_MiniPanel = VKF_MiniPanel  -- export for other code paths
+  ----------------------------------------------------------------
+-- MINI BREAKDOWN PANEL
+----------------------------------------------------------------
+function VKF_EnsureMiniPanel(anchorFrame)
+  if VKF_MiniPanel then return end
 
--- add this once, near your mini functions:
-function VKF_HideMini()
-  if _G.VKF_MiniPanel and _G.VKF_MiniPanel.Hide then
-    _G.VKF_MiniPanel:Hide()
+  local f = CreateFrame("Frame", "VKF_HKA_Mini", UIParent, "BackdropTemplate")
+  VKF_MiniPanel = f
+  _G.VKF_MiniPanel = VKF_MiniPanel  -- export for other code paths
+
+  -- Quick helper to hide
+  function VKF_HideMini()
+    if _G.VKF_MiniPanel and _G.VKF_MiniPanel.Hide then
+      _G.VKF_MiniPanel:Hide()
+    end
   end
+  _G.VKF_HideMini = VKF_HideMini
+
+  f:SetFrameStrata("TOOLTIP")
+  f:SetClampedToScreen(true)
+  f:SetSize(280, 110)
+  f:SetBackdrop({
+    bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
+    edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
+    tile     = true, tileSize = 16, edgeSize = 12,
+    insets   = { left = 4, right = 4, top = 4, bottom = 4 }
+  })
+  f:SetBackdropColor(0,0,0,0.92)
+  f:SetBackdropBorderColor(0,0,0,1)
+
+  f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  f.title:SetPoint("TOPLEFT", 8, -8)
+
+  f.line1 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  f.line1:SetPoint("TOPLEFT", f.title, "BOTTOMLEFT", 0, -8)
+
+  f.line2 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  f.line2:SetPoint("TOPLEFT", f.line1, "BOTTOMLEFT", 0, -6)
+
+  f.line3 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  f.line3:SetPoint("TOPLEFT", f.line2, "BOTTOMLEFT", 0, -6)
+
+  f:SetPropagateKeyboardInput(true)
+  f:EnableKeyboard(true)
+  f:SetScript("OnKeyDown", function(self, key)
+    if key == "ESCAPE" then self:Hide() end
+  end)
+
+  -- First fill (safe default)
+  VKF_FillMiniWithBreakdown(f)
+
+  -- Immediately apply saved scale
+  if VKF_ApplyScale then VKF_ApplyScale() end
 end
-_G.VKF_HideMini = VKF_HideMini
-	
-    f:SetFrameStrata("TOOLTIP")
-    f:SetClampedToScreen(true)
-    f:SetSize(280, 110)
-    f:SetBackdrop({
-      bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
-      edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
-      tile = true, tileSize = 16, edgeSize = 12,
-      insets   = { left = 4, right = 4, top = 4, bottom = 4 }
-    })
-    f:SetBackdropColor(0,0,0,0.92)
-    f:SetBackdropBorderColor(0,0,0,1)
-
-    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    f.title:SetPoint("TOPLEFT", 8, -8)
-
-    f.line1 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    f.line1:SetPoint("TOPLEFT", f.title, "BOTTOMLEFT", 0, -8)
-
-    f.line2 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    f.line2:SetPoint("TOPLEFT", f.line1, "BOTTOMLEFT", 0, -6)
-
-    f.line3 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    f.line3:SetPoint("TOPLEFT", f.line2, "BOTTOMLEFT", 0, -6)
 
 
-    f:SetPropagateKeyboardInput(true)
-    f:EnableKeyboard(true)
-    f:SetScript("OnKeyDown", function(self, key)
-      if key == "ESCAPE" then self:Hide() end
-    end)
-
-    -- First fill (safe default)
-    VKF_FillMiniWithBreakdown(f)
-  end
-
- function VKF_ShowMini(anchorFrame)
+function VKF_ShowMini(anchorFrame)
   VKF_EnsureMiniPanel(anchorFrame)
   local f = VKF_MiniPanel
   if not f then return end
@@ -1129,21 +1476,25 @@ _G.VKF_HideMini = VKF_HideMini
     f:SetPoint("CENTER", parent, "CENTER", 0, 0)
   end
 
+  -- Re-apply current scale right before showing
+  if VKF_ApplyScale then VKF_ApplyScale() end
+
   f:Show()
 end
 
-  function VKF_ToggleMini(anchorFrame)
-    if VKF_MiniPanel and VKF_MiniPanel:IsShown() then
-      VKF_MiniPanel:Hide()
-    else
-      VKF_ShowMini(anchorFrame)
-    end
-  end
 
-  -- make sure they’re reachable as globals too
-  _G.VKF_EnsureMiniPanel = VKF_EnsureMiniPanel
-  _G.VKF_ShowMini        = VKF_ShowMini
-  _G.VKF_ToggleMini      = VKF_ToggleMini
+function VKF_ToggleMini(anchorFrame)
+  if VKF_MiniPanel and VKF_MiniPanel:IsShown() then
+    VKF_MiniPanel:Hide()
+  else
+    VKF_ShowMini(anchorFrame)
+  end
+end
+
+-- Export for other code paths
+_G.VKF_EnsureMiniPanel = VKF_EnsureMiniPanel
+_G.VKF_ShowMini        = VKF_ShowMini
+_G.VKF_ToggleMini      = VKF_ToggleMini
 end
 
 
@@ -1239,6 +1590,8 @@ end)
 
 
   VKF_TotalsPanel.lines = {}
+   VKF_ApplyScale()
+  
 end
 
 local function AnchorTotalsToMenu()
@@ -1276,28 +1629,41 @@ local function BuildTotals()
   local totals = { money = 0, cur = {}, itm = {} }
   local totalSlots = GetMerchantNumItems()
   for slot = 1, totalSlots do
-    local link = GetMerchantItemLink(slot)
+    local info = VKF_GetSlotMeta(slot)
+    local link = info.link
+
     local function CountThis()
-      if IsEnsemble(link) then
-        if VKF_SkipUnavail_Sets and TooltipIsTemporarilyUnavailable(slot) then return false end
-        return not IsKnownSet(slot, link)
+      if not link then return false end
+
+      if info.isSet then
+        if VKF_SkipUnavail_Sets and info.isTempUnavailable then return false end
+        return not info.isKnownSet
       end
-      if ItemTeachesMount(link) then
-        if VKF_SkipUnavail_Mounts and TooltipIsTemporarilyUnavailable(slot) then return false end
-        return not IsMountKnown(link)
+
+      if info.isMount then
+        if VKF_SkipUnavail_Mounts and info.isTempUnavailable then return false end
+        return not info.isKnownMount
       end
-      if ItemTeachesPet(slot, link) then
-        if VKF_SkipUnavail_Pets and TooltipIsTemporarilyUnavailable(slot) then return false end
-        return not IsPetKnown(slot, link)
+
+      if info.isPet then
+        if VKF_SkipUnavail_Pets and info.isTempUnavailable then return false end
+        return not info.isKnownPet
       end
-      if ItemTeachesToy(slot, link) then
-        if VKF_SkipUnavail_Toys and TooltipIsTemporarilyUnavailable(slot) then return false end
-        return not IsToyKnown(slot, link)
+
+      if info.isToy then
+        if VKF_SkipUnavail_Toys and info.isTempUnavailable then return false end
+        return not info.isKnownToy
       end
+
       return false
     end
+
     if CountThis() then
-      local price = select(3, GetMerchantItemInfo(slot)); if price and price > 0 then totals.money = totals.money + price end
+      local price = select(3, GetMerchantItemInfo(slot))
+      if price and price > 0 then
+        totals.money = totals.money + price
+      end
+
       local nAlt = GetMerchantItemCostInfo(slot) or 0
       for i = 1, nAlt do
         local tex, amount, costLink = GetMerchantItemCostItem(slot, i)
@@ -1305,16 +1671,26 @@ local function BuildTotals()
           local curID = C_CurrencyInfo and C_CurrencyInfo.GetCurrencyIDFromLink(costLink)
           if curID then
             local key = "currency:"..curID
-            local info = C_CurrencyInfo.GetCurrencyInfo(curID)
-            local entry = totals.cur[key] or { name = info and info.name or ("Currency "..curID), icon = info and info.iconFileID or tex, amount = 0 }
-            entry.amount = entry.amount + amount; totals.cur[key] = entry
+            local infoC = C_CurrencyInfo.GetCurrencyInfo(curID)
+            local entry = totals.cur[key] or {
+              name   = infoC and infoC.name or ("Currency "..curID),
+              icon   = infoC and infoC.iconFileID or tex,
+              amount = 0,
+            }
+            entry.amount = entry.amount + amount
+            totals.cur[key] = entry
           else
             local itemID = GetItemInfoInstant(costLink)
             if itemID then
               local key = "item:"..itemID
               local name, _, _, _, _, _, _, _, _, icon = GetItemInfo(itemID)
-              local entry = totals.itm[key] or { name = name or ("Item "..itemID), icon = icon or tex, amount = 0 }
-              entry.amount = entry.amount + amount; totals.itm[key] = entry
+              local entry = totals.itm[key] or {
+                name   = name or ("Item "..itemID),
+                icon   = icon or tex,
+                amount = 0,
+              }
+              entry.amount = entry.amount + amount
+              totals.itm[key] = entry
             end
           end
         end
@@ -1371,82 +1747,146 @@ end
 
 
 local function UpdateTotalsUI()
+  ----------------------------------------------------------------
+  -- HARD GATE: if totals feature is not enabled, do nothing.
+  -- Treat nil or false as "off" to be safe.
+  ----------------------------------------------------------------
+  if not VKF_TotalsEnabled then
+    if VKF_TotalsPanel and VKF_TotalsPanel.Hide then
+      VKF_TotalsPanel:Hide()
+    end
+    return
+  end
+
+  ----------------------------------------------------------------
+  -- From this point on, totals are definitely enabled
+  ----------------------------------------------------------------
   AnchorTotalsToMenu()
-  if not VKF_TotalsPanel then return end
+  if not VKF_TotalsPanel then
+    return
+  end
+
   local totals = BuildTotals()
+  if not totals then
+    VKF_TotalsPanel:Hide()
+    return
+  end
+
+  ----------------------------------------------------------------
+  -- Money line
+  ----------------------------------------------------------------
   if totals.money and totals.money > 0 then
-    MoneyFrame_Update(VKF_TotalsPanel.money, totals.money); VKF_TotalsPanel.money:Show()
+    MoneyFrame_Update(VKF_TotalsPanel.money, totals.money)
+    VKF_TotalsPanel.money:Show()
   else
     VKF_TotalsPanel.money:Hide()
   end
+
+  ----------------------------------------------------------------
+  -- Clear old lines
+  ----------------------------------------------------------------
   ClearTotalsLines(VKF_TotalsPanel)
-  -- === Clickable Bronze line: compute directly from totals, not mirroring ===
-do
-  local b = VKF_TotalsPanel and VKF_TotalsPanel.bronzeBtn
-  if b then
-    -- Find Bronze (by name), else largest currency
-    local pick, bestAmt
-    for _, e in pairs(totals.cur or {}) do
-      local nm = (e.name or ""):lower()
-      if nm:find(LOC.BRONZE_TOKENS[1], 1, true) then pick = e; break end
-      if e.amount and e.amount > 0 then
-        if not bestAmt or e.amount > bestAmt then bestAmt = e.amount; pick = e end
-      end
-    end
 
-    if pick and pick.amount and pick.amount > 0 then
-      -- Style EXACTLY like AddLine(): 14x14 icon + "Label: |cffffffffamount|r"
-      if pick.icon then b.icon:SetTexture(pick.icon) else b.icon:SetTexture(132622) end
-      local amtText = BreakUpLargeNumbers and BreakUpLargeNumbers(pick.amount) or tostring(pick.amount)
-      local label   = pick.name or "Bronze"
-      b.text:SetText( string.format("%s: |cffffffff%s|r", label, amtText) )
-      b.text:SetJustifyH("LEFT")
-
-      -- Size and position identical to first AddLine row
-      local w = 6 + 14 + 6 + b.text:GetStringWidth() + 6
-      b:SetSize(w, 16)
-      b:ClearAllPoints()
-      b:SetPoint("TOPLEFT", VKF_TotalsPanel, "TOPLEFT", 6, -24)  -- same slot as the old left line
-      b:Show()
-    else
-      b:Hide()
-    end
-  end
-end
-  local y = -24
-  -- for _, e in pairs(totals.cur) do AddLine(VKF_TotalsPanel, e.icon, e.name, e.amount, y); y = y - 16 end
-  for _, e in pairs(totals.itm) do AddLine(VKF_TotalsPanel, e.icon, e.name, e.amount, y); y = y - 16 end
-  VKF_TotalsPanel:Show()
-  
-  -- === Fill the bronze button to match the left line exactly ===
+  ----------------------------------------------------------------
+  -- Clickable Bronze line: compute directly from totals, not mirroring
+  ----------------------------------------------------------------
   do
     local b = VKF_TotalsPanel and VKF_TotalsPanel.bronzeBtn
     if b then
-      local pick -- choose which currency to mirror (prefer Bronze by name)
-      for _, entry in pairs(totals.cur or {}) do
-        local nm = entry.name and entry.name:lower() or ""
-        if nm:find(LOC.BRONZE_TOKENS[1], 1, true) then pick = entry; break end
+      -- Find Bronze (by name), else largest currency
+      local pick, bestAmt
+      for _, e in pairs(totals.cur or {}) do
+        local nm = (e.name or ""):lower()
+        if LOC and LOC.BRONZE_TOKENS and LOC.BRONZE_TOKENS[1] and nm:find(LOC.BRONZE_TOKENS[1], 1, true) then
+          pick = e
+          break
+        end
+        if e.amount and e.amount > 0 then
+          if not bestAmt or e.amount > bestAmt then
+            bestAmt = e.amount
+            pick = e
+          end
+        end
       end
-      -- fallback: take the largest currency if "Bronze" wasn’t found
-      if not pick then
-        local bestAmt
-        for _, entry in pairs(totals.cur or {}) do
-          if type(entry.amount) == "number" and entry.amount > 0 then
-            if not bestAmt or entry.amount > bestAmt then
-              bestAmt = entry.amount; pick = entry
+
+      if pick and pick.amount and pick.amount > 0 then
+        -- Style EXACTLY like AddLine(): 14x14 icon + "Label: |cffffffffamount|r"
+        if pick.icon then
+          b.icon:SetTexture(pick.icon)
+        else
+          b.icon:SetTexture(132622)
+        end
+
+        local amtText = BreakUpLargeNumbers and BreakUpLargeNumbers(pick.amount) or tostring(pick.amount)
+        local label   = pick.name or "Bronze"
+        b.text:SetText(string.format("%s: |cffffffff%s|r", label, amtText))
+        b.text:SetJustifyH("LEFT")
+
+        -- Size and position identical to first AddLine row
+        local w = 6 + 14 + 6 + b.text:GetStringWidth() + 6
+        b:SetSize(w, 16)
+        b:ClearAllPoints()
+        b:SetPoint("TOPLEFT", VKF_TotalsPanel, "TOPLEFT", 6, -24)
+        b:Show()
+      else
+        b:Hide()
+      end
+    end
+  end
+
+  ----------------------------------------------------------------
+  -- Item lines
+  ----------------------------------------------------------------
+  local y = -24
+  -- for _, e in pairs(totals.cur) do AddLine(VKF_TotalsPanel, e.icon, e.name, e.amount, y); y = y - 16 end
+  for _, e in pairs(totals.itm or {}) do
+    AddLine(VKF_TotalsPanel, e.icon, e.name, e.amount, y)
+    y = y - 16
+  end
+
+  VKF_TotalsPanel:Show()
+
+  ----------------------------------------------------------------
+  -- (Optional) legacy "fill bronze button" block – left as-is
+  -- If you decide this is duplicate behavior, you can safely delete
+  -- this whole do/end block later.
+  ----------------------------------------------------------------
+  do
+    local b = VKF_TotalsPanel and VKF_TotalsPanel.bronzeBtn
+    if b then
+      local pick
+      if totals.cur then
+        for _, entry in pairs(totals.cur) do
+          local nm = entry.name and entry.name:lower() or ""
+          if LOC and LOC.BRONZE_TOKENS and LOC.BRONZE_TOKENS[1] and nm:find(LOC.BRONZE_TOKENS[1], 1, true) then
+            pick = entry
+            break
+          end
+        end
+        -- fallback: take the largest currency if "Bronze" wasn’t found
+        if not pick then
+          local bestAmt
+          for _, entry in pairs(totals.cur) do
+            if type(entry.amount) == "number" and entry.amount > 0 then
+              if not bestAmt or entry.amount > bestAmt then
+                bestAmt = entry.amount
+                pick = entry
+              end
             end
           end
         end
       end
 
       if pick and pick.amount and pick.amount > 0 then
-        -- icon identical size; text identical format "Name: |cffffffffamount|r"
-        if pick.icon then b.icon:SetTexture(pick.icon) end
+        if pick.icon then
+          b.icon:SetTexture(pick.icon)
+        end
         local amtText = BreakUpLargeNumbers and BreakUpLargeNumbers(pick.amount) or tostring(pick.amount)
-        local label   = pick.name or (LOC.BRONZE_TOKENS[1]:gsub("^(.)", string.upper))
-        b.text:SetText( string.format("%s: |cffffffff%s|r", label, amtText) )
+        local label   = pick.name or (LOC and LOC.BRONZE_TOKENS and LOC.BRONZE_TOKENS[1]
+                                      and LOC.BRONZE_TOKENS[1]:gsub("^(.)", string.upper)
+                                      or "Bronze")
+        b.text:SetText(string.format("%s: |cffffffff%s|r", label, amtText))
 
-        -- compute button width to fit icon + text exactly like a row
         local w = 6 + 14 + 6 + b.text:GetStringWidth() + 6
         b:SetSize(w, 16)
         b:Show()
@@ -1455,7 +1895,6 @@ end
       end
     end
   end
-
 end
 
 ----------------------------------------------------------------
@@ -1516,6 +1955,10 @@ end
 function HKA:Refresh()
   if inRefresh then return end
   inRefresh = true
+
+  -- start timing BEFORE the work
+  local t0 = debugprofilestop()
+
   pcall(function()
     if not (MerchantFrame and MerchantFrame:IsShown()) then return end
 
@@ -1559,13 +2002,24 @@ function HKA:Refresh()
         end
       end
     end
-	-- Re-apply pager using the filtered count (Blizzard just overwrote it)
-	VKF_UpdatePager(#filtered)
+
+    -- Re-apply pager using the filtered count (Blizzard just overwrote it)
+    VKF_UpdatePager(#filtered)
+
     ------------------------------------------------------
     -- Step 4: update totals panel (unchanged)
     ------------------------------------------------------
     UpdateTotalsUI()
   end)
+
+  -- end timing AFTER the work
+  local t1 = debugprofilestop()
+
+  -- simple debug print in the style you showed
+  local totalSlots = GetMerchantNumItems() or 0
+  local elapsed    = t1 - t0                    -- total ms
+  local perScan    = elapsed / math.max(1, totalSlots)
+  
   inRefresh = false
 end
 
@@ -1673,6 +2127,7 @@ local function EnsureMenuButton()
     GameTooltip:SetOwner(self, "ANCHOR_BOTTOMRIGHT")
     GameTooltip:AddLine(LOC.UI_GEAR_TIP_TITLE, 1,1,1)
     GameTooltip:AddLine(LOC.UI_GEAR_TIP_DESC, .9,.9,.9)
+	GameTooltip:AddLine(LOC.UI_GEAR_TIP_DESC2, .9,.9,.9)
     GameTooltip:Show()
   end)
   VKF_MenuButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1751,7 +2206,7 @@ function EnsureMenuPanel()
   else
     panel:SetPoint("TOPLEFT", MerchantFrame, "TOPRIGHT", 4, 0)
   end
-  panel:SetScale(1.0)
+  panel:SetScale(tonumber(VKF_Settings.uiScale) or 1.0)
   panel:SetFrameStrata("DIALOG")
   panel:SetClampedToScreen(true)
   panel:SetBackdrop({
@@ -1979,7 +2434,19 @@ end
 local function WireButton()
   if not VKF_MenuButton or VKF_MenuButton._wired then return end
   VKF_MenuButton._wired = true
-  VKF_MenuButton:SetScript("OnClick", function()
+
+  -- Left click = open main panel
+  -- Right click = open Settings window
+  VKF_MenuButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  VKF_MenuButton:SetScript("OnClick", function(self, button)
+    if button == "RightButton" then
+      if VKF_ToggleSettings then
+        VKF_ToggleSettings()
+      end
+      return
+    end
+
+    -- Default: left-click behavior
     EnsureMenuPanel()
     _G.VKF_MenuPanel:SetShown(not _G.VKF_MenuPanel:IsShown())
     PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
@@ -2274,12 +2741,70 @@ if hooksecurefunc then
     end
   end)
 end
+------------------------------------------------------------
+-- Shared vendor dump helper
+------------------------------------------------------------
+local function WL_DumpVendor()
+  if not MerchantFrame or not MerchantFrame:IsShown() then
+    print("|cffff5555Open a vendor first.|r")
+    return
+  end
 
--- ————— Replace ALL existing /wl slash blocks with this one —————
+  print("|cff66ccff" .. (LOC and LOC.UI_APP_NAME or "WhatsLeft") .. " vendor dump:|r")
+  print("---- WhatsLeft vendor dump ----")
+
+  for slot = 1, GetMerchantNumItems() do
+    local link = GetMerchantItemLink(slot)
+    if link then
+      local itemID = GetItemInfoInstant(link)
+      if itemID then
+        -- Safely get meta, if available
+        local meta = nil
+        if VKF_GetSlotMeta then
+          meta = VKF_GetSlotMeta(slot)
+        end
+
+        local isSet   = meta and meta.isSet   or false
+        local isMount = meta and meta.isMount or false
+        local isPet   = meta and meta.isPet   or false
+        local isToy   = meta and meta.isToy   or false
+
+        print(string.format(
+          "[%d] = { isSet=%s, isMount=%s, isPet=%s, isToy=%s },",
+          itemID,
+          tostring(isSet),
+          tostring(isMount),
+          tostring(isPet),
+          tostring(isToy)
+        ))
+      end
+    end
+  end
+end
+
+------------------------------------------------------------
+-- Slash commands: /wl changelog or /wlc
+------------------------------------------------------------
+SLASH_WL_CHANGELOG1 = "/wlc"
+SLASH_WL_CHANGELOG2 = "/wlchangelog"
+SlashCmdList["WL_CHANGELOG"] = function() VKF_ShowChangelog() end
+
+
+------------------------------------------------------------
+-- /wldumpvendor → direct dump command
+------------------------------------------------------------
+SLASH_WLDUMP1 = "/wldumpvendor"
+SlashCmdList["WLDUMP"] = function()
+  WL_DumpVendor()
+end
+
+------------------------------------------------------------
+-- /wl → include "dumpvendor" subcommand
+------------------------------------------------------------
 SLASH_WHATSLEFT1 = "/wl"
 
 SlashCmdList["WHATSLEFT"] = function(msg)
-  msg = string.lower(msg or "")
+  msg = string.lower(msg or ""):gsub("^%s+", ""):gsub("%s+$", "")
 
   local function ToggleMenu()
     EnsureMenuPanel()
@@ -2295,21 +2820,34 @@ SlashCmdList["WHATSLEFT"] = function(msg)
   if msg == "" or msg == "open" then
     ToggleMenu()
 
+  elseif msg == "settings" or msg == "config" then
+    VKF_ToggleSettings()
+	
+  elseif msg =="changelog" or msg == "changes" then
+  VKF_ShowChangelog()
+
+  elseif msg == "dumpvendor" or msg == "dump" then
+    WL_DumpVendor()
+
   elseif msg == "rescan" or msg == "refresh" or msg == "fix" then
-    if HKA and HKA.Refresh then HKA:Refresh() end
+    if HKA and HKA.Refresh then
+      HKA:Refresh()
+    end
     print("|cff50fa7b" .. LOC.UI_APP_NAME .. ":|r forced a vendor rescan.")
 
   elseif msg == "help" then
     print("|cff66ccff" .. LOC.UI_APP_NAME .. " commands:|r")
-    print("/wl            – open/close the menu")
-    print("/wl rescan     – force vendor refresh")
-    print("/wl help       – show this help")
+    print("/wl            – Open / Close What's Left?")
+    print("/wl settings   – Opens Settings Menu")
+    print("/wl dumpvendor – Dumps Vendor Data")
+    print("/wl rescan     – Force Vendor Refresh")
+	print("/wl changes    - Show Change Log")
+    print("/wl help       – Show This Message")
 
   else
     print("|cffff5555Unknown command.|r Type |cff66ccff/wl help|r for options.")
   end
 end
-
 
 -- ================================
 -- What's Left – In-game Changelog
@@ -2321,31 +2859,66 @@ VKF_LastSeenVersion = VKF_LastSeenVersion or "0.0.0"
 -- Your changelog data (edit this when you release)
 -- Most recent first.
 local VKF_CHANGELOG = {
+{
+    version = "1.3.0",
+    date    = "2025-11-12",
+    notes   = {
+"Eliminated the major stutter when opening vendors.",
+"Added throttled, soft, and hard repaint logic to prevent redundant scans.",
+"Fixed the issue where items stayed marked as mounts (or other types) due to incorrect precache data.",
+"Repaired vendor paging so page flips and vendor re-opens stay properly synced.",
+"Implemented the full Settings Menu with Saved Variables support.",
+"Added a real-time UI scale slider.",
+"UI scale now persists across /reload and login.",
+"Cleaned up slash commands.",
+"Added the in game Changelog window.",
+"Split the addon into multiple files to improve stability and maintainability.",
+"Fixed anchoring issues for Breakdown and Unlearned Totals panels.",
+"Improved real time \"learned\" item updates.",
+"Localization update.",
+"Right clicking the gear icon now opens the Settings panel.",
+"Widened the settings window and improved anchor points to prevent text overflow.",
+"Improved changelog spacing, padding, and general readability.",
+"Updated borders, dividers, and spacing for a cleaner, more modern UI feel.",
+
+"Updated slash command list to include /wl dumpvendor. |cff8ccfffIf you find a vendor that lags badly or doesn’t update correctly, run this command and share the output to help keep the addon strong and bug free.|r",
+    },
+},
+  {
+    version = "1.2.0",
+    date    = "2025-11-05",
+    notes   = {
+      "Full localization support for all official World of Warcraft clients.",
+      "Added complete language coverage: English, French, German, Spanish (EU and Latin American), Italian, Portuguese (BR), Russian, Korean, Simplified Chinese, and Traditional Chinese.",
+      "Implemented tooltip validation for each locale to ensure accurate detection of mounts, pets, toys, and ensembles.",
+      "Fixed false positives such as 'Highmountain Tides' being detected as a mount due to the word 'mount' in the name.",
+      "Mount detection now ignores any tooltip containing the word 'appearance'.",
+      "Refined ensemble recognition across all supported locales.",
+      "Updated localized addon descriptions (.toc Notes) and added X-Localizations metadata.",
+      "Minor fixes to breakdown totals and progress display alignment.",
+
+	  "— — — — —",
+      "Upcoming:",
+      "Optional Unlearned Totals toggle for more UI flexibility.",
+      "In game localization feedback and debugging support.",
+	  "Support for all vendors, any vendor that can sell anything learnable can be filtered, gear and weapons are currently in the works.",
+
+       "— — — — —",
+      "Minor visual delay may occur during rapid vendor page switching on high latency players.",
+      "Some localized punctuation may wrap incorrectly on small resolutions.",
+    },
+  },
   {
     version = "1.1.0",
     date    = "2025-10-27",
     notes   = {
-      "Fixed /reload and /afk bug (both caused by the same underlying refresh issue).",
-      "Resolved issue where /afk with ElvUI broke vendor frames.",
-      "Fixed 'Unicus' vendor Arsenal items not respecting the 'Hide Known' filter.",
-      "Corrected price, color updates after known items were removed, availability now displays properly.",
+      "Fixed /reload and /afk bug caused by refresh timing conflicts.",
+      "Resolved compatibility issue with ElvUI when entering /afk state.",
+      "Fixed vendor Arsenal items at 'Unicus' not respecting Hide Known.",
+      "Improved price and availability updates after removing known items.",
       "Pressing 'X' to close What's Left now also closes the Breakdown menu.",
       "Slash commands now work correctly: /wl , /wl help.",
-      "Improved compatibility with DialogueUI and other addons that modify vendor frames.",
-
-      "— — — — —",
-      "Upcoming:",
-      "Advanced Filtering (per-category behaviors).",
-      "Optional 'Unlearned Total' display (may cause minor hiccups).",
-      "Improved quest marker logic so the (!) icon follows quest items properly.",
-      "'/wl popup' command to auto-confirm vendor purchases.",
-      "Retail client integration.",
-
-      "— — — — —",
-      "Known issues:",
-      "• Slight hiccups may occur when scanning large vendor pages due to multiple repaints and currency tracking.",
-      "• Vendor quest item (!) icons occasionally fail to update when items move position.",
-      "• Currently optimized for English-language clients; broader localization support is planned for a future update."
+      "Improved compatibility with DialogueUI and other vendor-modifying addons.",
     },
   },
   {
@@ -2360,7 +2933,7 @@ local VKF_CHANGELOG = {
 -- --- Helpers ---
 local function WL_GetVersion()
   local v = GetAddOnMetadata and GetAddOnMetadata(ADDON, "Version")
-  return (type(v)=="string" and v ~= "" and v) or "1.1.0"
+  return (type(v)=="string" and v ~= "" and v) or "1.3.0"
 end
 
 local function WL_IsNewerVersion(a, b) -- "1.1.0" > "1.0.0"
@@ -2371,34 +2944,206 @@ local function WL_IsNewerVersion(a, b) -- "1.1.0" > "1.0.0"
   return a3 > b3
 end
 
--- --- UI: simple scrollable panel ---
+-- --- UI: collapsible changelog panel (no scrollframe, no jank) ---
 local VKF_ChangelogFrame
+local VKF_ChangelogEntries = {}
+local VKF_ChangelogBody
 
-local function VKF_BuildChangelogText()
-  local t = {}
-  for _, entry in ipairs(VKF_CHANGELOG) do
-    table.insert(t, ("|cffffffffv%s|r  |cffbbbbbb(%s)|r"):format(entry.version, entry.date or ""))
-    for _, line in ipairs(entry.notes or {}) do
-      table.insert(t, "  • "..line)
+-- Create a single collapsible entry for one version
+local function VKF_CreateChangelogEntry(parent, index, entry)
+  local container = CreateFrame("Frame", nil, parent, "BackdropTemplate")
+  container.entry = entry
+  container.expanded = (index == 1)      -- latest open by default
+  container.collapsedHeight = 26
+  container.expandedHeight  = 0
+
+  container:SetBackdrop({
+    bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
+    edgeFile = "Interface/Buttons/WHITE8x8",
+    tile     = true, tileSize = 16, edgeSize = 1,
+    insets   = { left = 1, right = 1, top = 1, bottom = 1 },
+  })
+  container:SetBackdropColor(0, 0, 0, 0.65)
+  container:SetBackdropBorderColor(0, 0, 0, 0.9)
+
+  -------------------------------------------------
+  -- Header (version + date + arrow)
+  -------------------------------------------------
+  local header = CreateFrame("Button", nil, container)
+  header:SetPoint("TOPLEFT", 6, -4)
+  header:SetPoint("TOPRIGHT", -6, -4)
+  header:SetHeight(22)
+  header:SetHighlightTexture("Interface\\Buttons\\UI-Listbox-Highlight2", "ADD")
+
+  local arrow = header:CreateTexture(nil, "ARTWORK")
+  arrow:SetTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up")
+  arrow:SetSize(14, 14)
+  arrow:SetPoint("LEFT", 2, 0)
+
+  local label = header:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  label:SetPoint("LEFT", arrow, "RIGHT", 4, 0)
+  label:SetJustifyH("LEFT")
+
+  local isLatest = (index == 1)
+  local versionColor = isLatest and "|cff8cccff" or "|cffffffff"
+  local dateText = entry.date and entry.date ~= "" and (" |cffbbbbbb(%s)|r"):format(entry.date) or ""
+  label:SetText(("%sv%s|r%s"):format(versionColor, entry.version, dateText))
+
+  -------------------------------------------------
+  -- Body text (notes)
+  -------------------------------------------------
+  local bodyFS = container:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  bodyFS:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 18, -4)
+  bodyFS:SetPoint("RIGHT", -10, 0)
+  bodyFS:SetJustifyH("LEFT")
+  bodyFS:SetJustifyV("TOP")
+
+  local lines = {}
+  for _, line in ipairs(entry.notes or {}) do
+    if line == "— — — — —" then
+      table.insert(lines, " ")                               -- spacer
+    elseif line == "Upcoming:" then
+      table.insert(lines, "|cffffff00" .. line .. "|r")      -- yellow subheader
+    else
+      table.insert(lines, "• " .. line)
     end
-    table.insert(t, " ") -- spacer
   end
-  return table.concat(t, "\n")
+  bodyFS:SetText(table.concat(lines, "\n"))
+
+  container.header = header
+  container.arrow  = arrow
+  container.bodyFS = bodyFS
+
+  table.insert(VKF_ChangelogEntries, container)
+  return container
+end
+
+-- Layout all entries and recompute heights
+-- Layout all entries and recompute heights
+local function VKF_LayoutChangelog()
+  if not VKF_ChangelogBody then return end
+
+  local body   = VKF_ChangelogBody
+  local parent = body:GetParent()
+  if not parent then return end
+
+  -- Figure out how tall the visible area actually is
+  local parentH = parent:GetHeight() or 420
+
+  -- derive vertical padding from body anchors (TOP and BOTTOM)
+  local _, _, _, _, topOff  = body:GetPoint(1)  -- e.g. TOPLEFT, x=12, y=-36
+  local _, _, _, _, botOff  = body:GetPoint(2)  -- e.g. BOTTOMRIGHT, x=-12, y=12
+  local padTop  = math.abs(topOff or 0)
+  local padBot  = math.abs(botOff or 0)
+  local visibleHeight = parentH - (padTop + padBot)
+  if visibleHeight < 50 then visibleHeight = parentH end
+
+  -- usable width for text
+  local width  = body:GetWidth()
+  if not width or width <= 0 then width = 420 end
+
+  local usedHeight = 0
+
+  for i, c in ipairs(VKF_ChangelogEntries) do
+    -- measure text
+    c.bodyFS:SetWidth(width - 36)
+    c.bodyFS:SetHeight(0)
+    local textH = c.bodyFS:GetStringHeight()
+    if textH < 4 then textH = 4 end
+
+    c.expandedHeight = c.collapsedHeight + textH + 8
+
+    local thisHeight
+    if c.expanded then
+      thisHeight = c.expandedHeight
+      c.bodyFS:Show()
+      c.arrow:SetRotation(0)             -- down
+    else
+      thisHeight = c.collapsedHeight
+      c.bodyFS:Hide()
+      c.arrow:SetRotation(math.rad(-90)) -- right
+    end
+
+    -- If this entry would go past the visible area, hide it
+    if (usedHeight + thisHeight) > visibleHeight then
+      c:Hide()
+    else
+      c:Show()
+      c:ClearAllPoints()
+      if i == 1 then
+        c:SetPoint("TOPLEFT", body, "TOPLEFT", 0, 0)
+        c:SetPoint("TOPRIGHT", body, "TOPRIGHT", 0, 0)
+      else
+        -- anchor under the last *visible* entry
+        local prev = nil
+        for j = i-1, 1, -1 do
+          if VKF_ChangelogEntries[j]:IsShown() then
+            prev = VKF_ChangelogEntries[j]
+            break
+          end
+        end
+        if prev then
+          c:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -6)
+          c:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -6)
+        else
+          c:SetPoint("TOPLEFT", body, "TOPLEFT", 0, 0)
+          c:SetPoint("TOPRIGHT", body, "TOPRIGHT", 0, 0)
+        end
+      end
+
+      c:SetHeight(thisHeight)
+      usedHeight = usedHeight + thisHeight + 6
+    end
+  end
+
+  body:SetHeight(usedHeight)
+end
+
+
+local function VKF_BuildChangelogUI(body)
+  wipe(VKF_ChangelogEntries)
+  VKF_ChangelogBody = body
+
+  -- Create entries
+  for i, entry in ipairs(VKF_CHANGELOG) do
+    local c = VKF_CreateChangelogEntry(body, i, entry)
+
+    -- Click header: collapse others, toggle this one
+    c.header:SetScript("OnClick", function()
+
+      -- Collapse all other entries
+      for _, other in ipairs(VKF_ChangelogEntries) do
+        if other ~= c then
+          other.expanded = false
+        end
+      end
+
+      -- Toggle this entry
+      c.expanded = not c.expanded
+
+      -- Recalculate full layout
+      VKF_LayoutChangelog()
+    end)
+  end
+
+  -- Layout once the frame is fully created
+  C_Timer.After(0, VKF_LayoutChangelog)
 end
 
 local function VKF_EnsureChangelogFrame()
   if VKF_ChangelogFrame then return end
+
   local f = CreateFrame("Frame", "VKF_WL_Changelog", UIParent, "BackdropTemplate")
   VKF_ChangelogFrame = f
-  f:SetSize(480, 420)
+  f:SetSize(520, 420)
   f:SetPoint("CENTER")
   f:SetFrameStrata("DIALOG")
   f:SetClampedToScreen(true)
   f:SetBackdrop({
-    bgFile = "Interface/Tooltips/UI-Tooltip-Background",
+    bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
     edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 12,
-    insets = { left=4, right=4, top=4, bottom=4 }
+    tile     = true, tileSize = 16, edgeSize = 12,
+    insets   = { left = 4, right = 4, top = 4, bottom = 4 },
   })
   f:SetBackdropColor(0,0,0,0.93)
   f:SetBackdropBorderColor(0,0,0,1)
@@ -2410,31 +3155,17 @@ local function VKF_EnsureChangelogFrame()
   local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", 2, 2)
 
-  -- Scrollable body
-  local sf = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
-  sf:SetPoint("TOPLEFT", 12, -36)
-  sf:SetPoint("BOTTOMRIGHT", -28, 12)
+  -- Body area (no ScrollFrame – just a content region)
+  local body = CreateFrame("Frame", nil, f)
+  VKF_ChangelogBody = body
+  body:SetPoint("TOPLEFT", 12, -36)
+  body:SetPoint("BOTTOMRIGHT", -12, 12)
+  body:SetClipsChildren(false)
 
-  local body = CreateFrame("Frame", nil, sf)
-  body:SetSize(1, 1)
-  sf:SetScrollChild(body)
+  VKF_BuildChangelogUI(body)
 
-  local text = body:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  text:SetPoint("TOPLEFT", 0, 0)
-  text:SetPoint("RIGHT", -4, 0)
-  text:SetJustifyH("LEFT")
-  text:SetJustifyV("TOP")
-  text:SetText(VKF_BuildChangelogText())
-
-  -- Autosize height to contents
-  C_Timer.After(0, function()
-    text:SetWidth(sf:GetWidth() - 6)
-    local h = math.max(200, text:GetStringHeight() + 4)
-    body:SetSize(sf:GetWidth(), h)
-  end)
-
-  -- Tiny footer
- local verFS = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  -- Tiny footer: current version
+  local verFS = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   verFS:SetPoint("TOPRIGHT", -28, -16)
   verFS:SetJustifyH("RIGHT")
   verFS:SetText(("Current: |cffffffffv%s|r"):format(WL_GetVersion()))
@@ -2445,11 +3176,6 @@ function VKF_ShowChangelog()
   VKF_ChangelogFrame:Show()
   PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
 end
-
--- Slash commands: /wl changelog or /wlc
-SLASH_WL_CHANGELOG1 = "/wlc"
-SLASH_WL_CHANGELOG2 = "/wlchangelog"
-SlashCmdList["WL_CHANGELOG"] = function() VKF_ShowChangelog() end
 
 -- Show on update (first login after a new version)
 local WL_Changelog_Events = CreateFrame("Frame")
