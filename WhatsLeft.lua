@@ -28,7 +28,9 @@ function VKF_ApplyScale()
   if _G.VKF_MenuPanel   and VKF_MenuPanel.SetScale   then VKF_MenuPanel:SetScale(s) end
   if _G.VKF_TotalsPanel and VKF_TotalsPanel.SetScale then VKF_TotalsPanel:SetScale(s) end
   if _G.VKF_MiniPanel   and VKF_MiniPanel.SetScale   then VKF_MiniPanel:SetScale(s) end
+  if VKF_SettingsFrame and VKF_SettingsFrame.SetScale then VKF_SettingsFrame:SetScale(s) end
 end
+
 
 
 ----------------------------------------------------------------
@@ -234,6 +236,7 @@ VKF_SkipUnavail_Toys   = on(VKF_SkipUnavail_Toys)
 VKF_SkipUnavail_Sets   = on(VKF_SkipUnavail_Sets)
 VKF_SkipUnavail_Mounts = on(VKF_SkipUnavail_Mounts)
 VKF_SkipUnavail_Pets   = on(VKF_SkipUnavail_Pets)
+VKF_HideGear           = on(VKF_HideGear)
 
 if type(VKF_TotalsEnabled) ~= "boolean" then
   VKF_TotalsEnabled = true
@@ -244,7 +247,9 @@ WL_Enabled = WL_Enabled or false
 -- HELPERS
 ----------------------------------------------------------------
 
-
+local function WL_IsBuyback()
+    return MerchantFrame and MerchantFrame.selectedTab == 2
+end
 
 -- Validates merchant slot is real & ready
 local function VKF_IsValidSlot(slot)
@@ -519,9 +524,17 @@ local function WL_ParseCollectedProgressFromTooltip(slot)
   VKF_ScannerEachLine(function(L, R)
     local function grab(fs)
       local s = _vkf_sanitize_lower(fs and fs:GetText()); if not s then return end
-      -- Try every localized pattern
-      for _, pat in ipairs((LOC and LOC.COLLECTED_PROGRESS_PATTERNS) or { "collected%s*%((%d+)%s*/%s*(%d+)%)" }) do
-        local a, b = s:match(pat)
+      -- 1) Try every localized pattern that includes the word ("collected", etc.)
+      if LOC and LOC.COLLECTED_PROGRESS_PATTERNS then
+        for _, pat in ipairs(LOC.COLLECTED_PROGRESS_PATTERNS) do
+          local a, b = s:match(pat)
+          if a and b then c, t = tonumber(a), tonumber(b); return end
+        end
+      end
+
+      -- 2) Fallback: just grab "(x / y)" anywhere, no localized word needed
+      if not c then
+        local a, b = s:match("%((%d+)%s*/%s*(%d+)%)")
         if a and b then c, t = tonumber(a), tonumber(b); return end
       end
     end
@@ -531,15 +544,26 @@ local function WL_ParseCollectedProgressFromTooltip(slot)
   return c, t
 end
 
--- Goal rule: singles (1/1) are always “at goal”; 3-cap pets must equal the goal.
+-- Goal rule: singles (1/1) always hide once collected.
+-- Multi copy pets hide once collected >= goal.
 local function WL_ShouldHidePetByGoal(collected, total, goal)
-  if not collected or not total or not goal then return false end
+  if not collected or not total or not goal then
+    return false
+  end
+
+  -- Always hide single copy pets once you own one
   if total <= 1 then
-    -- 1-cap (only one copy exists)
     return collected >= 1
   end
-  -- 3-cap (battle pets)
-  return (total >= 3) and (collected == goal)
+
+  -- Clamp goal between 1 and total
+  if goal < 1 then
+    goal = 1
+  elseif goal > total then
+    goal = total
+  end
+
+  return collected >= goal
 end
 
 
@@ -709,6 +733,68 @@ end
 ----------------------------------------------------------------
 -- CATEGORY CHECKS
 ----------------------------------------------------------------
+local WL_BuggedEnsemblePinged = {}
+
+local function WL_AlertBuggedEnsemble(link, missingCount)
+    local name = link and GetItemInfo(link) or nil
+    local msg
+
+    -- Determine plural suffix for the locale (fallback to "s")
+    local plural = (missingCount == 1) and "" or (LOC.PLURAL_S or "s")
+
+    if missingCount and missingCount > 0 then
+        if name then
+            msg = string.format(
+                LOC.ALERT_MISSED_NAMED or "One of your ensembles missed %d appearance%s: %s",
+                missingCount,
+                plural,
+                name
+            )
+        else
+            msg = string.format(
+                LOC.ALERT_MISSED_COUNT or "One of your ensembles missed %d appearance%s!",
+                missingCount,
+                plural
+            )
+        end
+    else
+        msg = LOC.ALERT_MISSED_GENERIC or "One of your ensembles missed an item!"
+    end
+
+    -- Read current mode from settings
+    local mode = (VKF_Settings and VKF_Settings.ensembleNotify) or "enabled"
+    if mode ~= "enabled" and mode ~= "silenced" and mode ~= "disabled" then
+        mode = "enabled"
+        VKF_Settings.ensembleNotify = mode
+    end
+
+    -- If completely disabled, bail out
+    if mode == "disabled" then
+        return
+    end
+
+    -- Big center-screen raid warning + top error text (only when fully enabled)
+    if mode == "enabled" then
+        if RaidNotice_AddMessage and RaidWarningFrame then
+            RaidNotice_AddMessage(RaidWarningFrame, msg, { r = 0.4, g = 0.8, b = 1.0 })
+        end
+
+    end
+
+    -- Localized addon title in chat (both Enabled + Silenced)
+    local appTitle = LOC.UI_APP_TITLE or "What's Left?"
+    print("|cff66ccff[" .. appTitle .. "]|r " .. msg)
+
+    -- Sound only in Enabled mode
+    if mode == "enabled" and PlaySound then
+        if SOUNDKIT and SOUNDKIT.RAID_WARNING then
+            PlaySound(SOUNDKIT.RAID_WARNING)
+        else
+            PlaySound(12889) -- fallback, or swap to your chirp ID
+        end
+    end
+end
+
 -- Bundle items that teach multiple appearances (Ensemble/Arsenal/etc.)
 local function IsEnsemble(link, slot)
   if not link then return false end
@@ -724,26 +810,289 @@ local function IsEnsemble(link, slot)
   return false
 end
 
+-- ===== Transmog "known" helpers =====
+----------------------------------------------------------------
+-- TRANSMOG COLLECTION HELPERS
+----------------------------------------------------------------
+local function IsAppearanceKnownFromAnySource(link)
+    if not link or not C_TransmogCollection or not C_TransmogCollection.GetItemInfo then
+        return nil
+    end
+
+    local itemID = GetItemInfoInstant(link)
+    local appearanceID, sourceID
+
+    -- 1) Try by itemID first
+    if itemID then
+        appearanceID, sourceID = C_TransmogCollection.GetItemInfo(itemID)
+    end
+
+    -- 2) Fall back to raw link if needed
+    if (not appearanceID or appearanceID == 0) then
+        local a2, s2 = C_TransmogCollection.GetItemInfo(link)
+        if a2 and a2 ~= 0 then
+            appearanceID = a2
+            sourceID     = s2
+        end
+    end
+
+    -- If we still don't have an appearance, we can't do appearance-level logic
+    if not appearanceID or appearanceID == 0 then
+        if sourceID and C_TransmogCollection.GetSourceInfo then
+            local info = C_TransmogCollection.GetSourceInfo(sourceID)
+            if info then
+                return info.isCollected or false
+            end
+        end
+        -- Total black box: let caller fall back to other APIs / tooltip
+        return nil
+    end
+
+    local sources
+    if C_TransmogCollection.GetAppearanceSources then
+        sources = C_TransmogCollection.GetAppearanceSources(appearanceID)
+    end
+
+    ----------------------------------------------------------------
+    -- Fallback: some legacy / replica items have no appearance sources
+    -- but GetItemInfo still gave us a sourceID. Use that directly.
+    ----------------------------------------------------------------
+    if (not sources or #sources == 0) and sourceID and C_TransmogCollection.GetSourceInfo then
+        local info = C_TransmogCollection.GetSourceInfo(sourceID)
+        if info then
+            sources = { info }
+        end
+    end
+
+    if not sources or #sources == 0 then
+        return nil
+    end
+
+    local anyCollected = false
+    for _, src in ipairs(sources) do
+        if src.isCollected then
+            anyCollected = true
+            break
+        end
+    end
+
+    return anyCollected
+end
+
+
 local function IsKnownByTransmogAPI(link)
-  if not link then return false end
-  local itemID = GetItemInfoInstant(link)
-  if not itemID then return false end
-  if C_TransmogCollection and C_TransmogCollection.PlayerHasTransmogItemModifiedAppearance then
-    local k = C_TransmogCollection.PlayerHasTransmogItemModifiedAppearance(itemID)
-    if k ~= nil then return k end
+    if not link or not C_TransmogCollection then
+        return false
+    end
+
+    --------------------------------------------------------
+    -- 1) Appearance-level first
+    --------------------------------------------------------
+    local known = IsAppearanceKnownFromAnySource(link)
+    if known ~= nil then
+        return known
+    end
+
+    --------------------------------------------------------
+    -- 2) Modern helper
+    --------------------------------------------------------
+    if C_TransmogCollection.PlayerHasTransmogByItemInfo then
+        local ok = C_TransmogCollection.PlayerHasTransmogByItemInfo(link)
+        if ok ~= nil then
+            return ok
+        end
+    end
+
+    --------------------------------------------------------
+    -- 3) Older helpers
+    --------------------------------------------------------
+    local itemID = GetItemInfoInstant(link)
+
+    if itemID and C_TransmogCollection.PlayerHasTransmogItemModifiedAppearance then
+        local ok = C_TransmogCollection.PlayerHasTransmogItemModifiedAppearance(itemID)
+        if ok ~= nil then return ok end
+    end
+
+    if itemID and C_TransmogCollection.PlayerHasTransmog then
+        local ok = C_TransmogCollection.PlayerHasTransmog(itemID)
+        if ok ~= nil then return ok end
+    end
+
+    return false
+end
+
+local function WL_IsAppearanceKnown(appearanceID)
+  if not appearanceID then
+    return false
   end
-  if C_TransmogCollection and C_TransmogCollection.PlayerHasTransmog then
-    local k = C_TransmogCollection.PlayerHasTransmog(itemID)
-    if k ~= nil then return k end
+  if not C_TransmogCollection or not C_TransmogCollection.GetAppearanceSources then
+    return false
   end
+
+  local sources = C_TransmogCollection.GetAppearanceSources(appearanceID)
+  if not sources or #sources == 0 then
+    return false
+  end
+
+  for _, src in ipairs(sources) do
+    -- If ANY source for this appearance is collected, we treat the appearance as known.
+    if src.isCollected then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function WL_IsAppearanceKnown(appearanceID)
+  if not appearanceID then
+    return false
+  end
+  if not C_TransmogCollection or not C_TransmogCollection.GetAppearanceSources then
+    return false
+  end
+
+  local sources = C_TransmogCollection.GetAppearanceSources(appearanceID)
+  if not sources or #sources == 0 then
+    return false
+  end
+
+  for _, src in ipairs(sources) do
+    -- If ANY source for this appearance is collected, we treat the appearance as known.
+    if src.isCollected then
+      return true
+    end
+  end
+
   return false
 end
 
 local function IsKnownSet(slot, link)
-  if not link or not IsEnsemble(link, slot) then return false end
-  if TooltipHasAlreadyKnown(slot) then return true end
+  if not link or not IsEnsemble(link, slot) then
+    return false
+  end
+
+  local ensembleItemID = GetItemInfoInstant(link)
+
+  -- 1) If we have explicit appearance data for this ensemble, use that.
+  if ensembleItemID and WL_EnsembleAppearances and WL_EnsembleAppearances[ensembleItemID] then
+    local list = WL_EnsembleAppearances[ensembleItemID]
+
+    local missing = 0
+    for _, appearanceID in ipairs(list) do
+      if not WL_IsAppearanceKnown(appearanceID) then
+        missing = missing + 1
+      end
+    end
+
+    -- Ask the game if it *thinks* this ensemble is already known
+    local gameThinksKnown = false
+    if TooltipHasAlreadyKnown and slot then
+      gameThinksKnown = TooltipHasAlreadyKnown(slot)
+    end
+    if not gameThinksKnown then
+      gameThinksKnown = IsKnownByTransmogAPI(link)
+    end
+
+    -- If the game says "known" but we still see missing appearances,
+    -- then this was a scuffed learn → yell once per itemID.
+    if missing > 0 then
+      if gameThinksKnown and not WL_BuggedEnsemblePinged[ensembleItemID] then
+        WL_BuggedEnsemblePinged[ensembleItemID] = true
+        WL_AlertBuggedEnsemble(link, missing)
+      end
+
+      -- Not fully collected → do NOT hide this ensemble.
+      return false
+    end
+
+    -- Every appearance we know about is collected → ok to hide this ensemble.
+    return true
+  end
+
+  -- 2) Fallback: behave like the old logic for ensembles we haven't mapped yet.
+  if TooltipHasAlreadyKnown(slot) then
+    return true
+  end
+
   return IsKnownByTransmogAPI(link)
 end
+
+----------------------------------------------------------------
+-- Detect if an item is a transmog-eligible gear/weapon piece.
+-- No tooltip text, only item data + transmog APIs.
+----------------------------------------------------------------
+
+local GEAR_EQUIP_SLOTS = {
+  INVTYPE_HEAD      = true,
+  INVTYPE_SHOULDER  = true,
+  INVTYPE_CHEST     = true,
+  INVTYPE_ROBE      = true,
+  INVTYPE_WAIST     = true,
+  INVTYPE_LEGS      = true,
+  INVTYPE_FEET      = true,
+  INVTYPE_WRIST     = true,
+  INVTYPE_HAND      = true,
+  INVTYPE_CLOAK     = true,
+  INVTYPE_TABARD    = true,
+
+  INVTYPE_WEAPON    = true,
+  INVTYPE_2HWEAPON  = true,
+  INVTYPE_WEAPONMAINHAND = true,
+  INVTYPE_WEAPONOFFHAND = true,
+  INVTYPE_SHIELD    = true,
+  INVTYPE_HOLDABLE  = true,
+  INVTYPE_RANGED    = true,
+  INVTYPE_RANGEDRIGHT = true,
+}
+function IsTransmogItem(link)
+  if not link then return false end
+
+  local itemID = GetItemInfoInstant(link)
+  if not itemID then return false end
+
+  -- Hard gate: only real gear slots count as transmogable
+  local _, _, quality, _, _, _, _, _, equipLoc = GetItemInfo(link)
+  if not equipLoc or not GEAR_EQUIP_SLOTS[equipLoc] then
+    return false
+  end
+  if quality and quality < 2 then --Gear quality setting, 2 is uncommon, 1 is common, etc etc, maybe make this a setting 
+    return false
+  end
+
+  -- Prefer Blizzard’s transmog APIs when they cooperate
+  if C_Transmog and C_Transmog.GetItemInfo then
+    local _, _, canBeSource = C_Transmog.GetItemInfo(itemID)
+    if canBeSource ~= nil then
+      if canBeSource then
+        return true
+      else
+        -- fall through to heuristics
+      end
+    end
+  end
+
+  if C_TransmogCollection and C_TransmogCollection.GetItemInfo then
+    local appearanceID, modifiedID = C_TransmogCollection.GetItemInfo(link)
+    if (not appearanceID or appearanceID == 0) and itemID then
+      appearanceID, modifiedID = C_TransmogCollection.GetItemInfo(itemID)
+    end
+    if appearanceID or modifiedID then
+      return true
+    end
+  end
+
+  if C_TransmogCollection and C_TransmogCollection.PlayerHasTransmogByItemInfo then
+    local known = C_TransmogCollection.PlayerHasTransmogByItemInfo(link)
+    if known ~= nil then
+      return true
+    end
+  end
+
+  -- Fallback: at this point we know it’s uncommon+ gear in a real slot
+  return true
+end
+
 
 -- Mounts
 local function ItemTeachesMount(link)
@@ -978,11 +1327,13 @@ local function VKF_GetSlotMeta(slot)
     isMount           = false,
     isPet             = false,
     isToy             = false,
+	isTransmog        = false,
     isTempUnavailable = false,
     isKnownSet        = false,
     isKnownMount      = false,
     isKnownPet        = false,
     isKnownToy        = false,
+	isKnownTransmog   = false,
   }
 
 if not VKF_IsValidSlot(slot) then
@@ -1025,42 +1376,80 @@ info.link = link
   ------------------------------------------------------------
   WL_ItemMetaDB = WL_ItemMetaDB or {}
 
-  local itemID = GetItemInfoInstant(link)
-  local db = itemID and WL_ItemMetaDB[itemID] or nil
+-- ALWAYS get the real item link
+local link = GetMerchantItemLink(slot)
+if not link then return nil end
 
+-- Resolve true itemID from the link (DO NOT FILTER IT)
+local itemID = GetItemInfoInstant(link)
+
+-- DB lookup on real itemID
+local db = itemID and WL_ItemMetaDB[itemID] or nil
+
+ ------------------------------------------------------------
+  -- 1) Classification: use DB if present,
   ------------------------------------------------------------
-  -- 1) Classification: use DB if present, otherwise detect once
-  ------------------------------------------------------------
-  if db then
-    -- Only the type flags (cheap, static per itemID)
-    info.isSet   = not not db.isSet
-    info.isMount = not not db.isMount
-    info.isPet   = not not db.isPet
-    info.isToy   = not not db.isToy
+    if db then
+    info.isSet      = not not db.isSet
+    info.isMount    = not not db.isMount
+    info.isPet      = not not db.isPet
+    info.isToy      = not not db.isToy
+    info.isTransmog = not not db.isTransmog
+
+    -- Safety valve:
+    -- If this looks like normal gear (not set/mount/pet/toy) and DB says
+    -- "not transmog", re-run the newer IsTransmogItem() once and upgrade.
+    if not info.isSet and not info.isMount and not info.isPet and not info.isToy
+       and not info.isTransmog
+       and IsTransmogItem(link) then
+      info.isTransmog = true
+      db.isTransmog   = true
+    end
+
+    ------------------------------------------------------------
+    -- EXTRA SAFETY: if the live detector says this teaches a pet,
+    -- trust that over the DB so pets never show up as "gear".
+    ------------------------------------------------------------
+    if not info.isPet then
+      local teachesPet = ItemTeachesPet(slot, link)
+      if teachesPet ~= nil then
+        -- Force this into the pet bucket
+        info.isPet      = true
+        info.isMount    = false
+        info.isToy      = false
+        -- Pets are not normal transmog gear
+        if not info.isSet then
+          info.isTransmog = false
+        end
+
+        if db then
+          db.isPet      = true
+          db.isMount    = false
+          db.isToy      = false
+          if not info.isSet then
+            db.isTransmog = false
+          end
+        end
+      end
+    end
   else
-    -- Expensive detection path (run once per unknown itemID)
-    if DetectMount(slot, link) then
+    -- Fresh classification path (unchanged)
+    if ItemTeachesMount(link) then
       info.isMount = true
-    elseif DetectPet(slot, link) then
+    elseif ItemTeachesPet(slot, link) then
       info.isPet = true
-    elseif DetectToy(slot, link) then
+    elseif ItemTeachesToy(slot, link) then
       info.isToy = true
     elseif IsEnsemble(link, slot) then
-      info.isSet = true
-    end
-
-    -- Seed DB entry for this itemID so we never redo classification
-    if itemID then
-      db = {
-        isSet   = info.isSet,
-        isMount = info.isMount,
-        isPet   = info.isPet,
-        isToy   = info.isToy,
-      }
-      WL_ItemMetaDB[itemID] = db
+      info.isSet      = true
+      info.isTransmog = true
+    elseif IsTransmogItem(link) then
+      info.isTransmog = true
     end
   end
-
+  
+  
+  
 ------------------------------------------------------------
   -- 2) Known/unavailable: recompute dynamic known states every scan
   ------------------------------------------------------------
@@ -1082,19 +1471,54 @@ info.link = link
     if db then db.isKnownToy = known end
   end
 
+  do
+    local name = info.name
+    if not name and link and GetItemInfo then
+      name = GetItemInfo(link)
+      info.name = name
+    end
+
+    if type(name) == "string" and name:find("Strange Humming Crystal", 1, true) then
+      local speciesID = 1937 -- Wondrous Wisdomball
+      if C_PetJournal and C_PetJournal.GetNumCollectedInfo then
+        local owned = select(1, C_PetJournal.GetNumCollectedInfo(speciesID))
+        if type(owned) == "number" and owned > 0 then
+          info.isPet      = true
+          info.isKnownPet = true
+          if db then
+            db.isPet      = true
+            db.isKnownPet = true
+          end
+        end
+      end
+    end
+  end
+
   if info.isSet then
     local known = IsKnownSet(slot, link)
     info.isKnownSet = known
     if db then db.isKnownSet = known end
   end
 
-  if db then
-    if db.isTempUnavailable == nil then
-      db.isTempUnavailable = TooltipIsTemporarilyUnavailable(slot)
+  if info.isTransmog then
+    -- First try all the transmog APIs
+    local known = IsKnownByTransmogAPI(link)
+
+    -- Legacy PvP / weird vendors: fall back to tooltip text
+    if not known then
+      -- "Collected (x/y)" with x > 0
+      if TooltipHasCollected and TooltipHasCollected(slot) then
+        known = true
+      -- Generic "Already known" style line
+      elseif TooltipHasAlreadyKnown and TooltipHasAlreadyKnown(slot) then
+        known = true
+      end
     end
-    info.isTempUnavailable = db.isTempUnavailable or false
-  else
-    info.isTempUnavailable = TooltipIsTemporarilyUnavailable(slot)
+
+    info.isKnownTransmog = known
+    if db then
+      db.isKnownTransmog = known
+    end
   end
 
   ------------------------------------------------------------
@@ -1106,13 +1530,21 @@ end
 
 
 ----------------------------------------------------------------
--- FILTER (gapless list)
-----------------------------------------------------------------
-----------------------------------------------------------------
--- FILTER (gapless list) – now uses VKF_GetSlotMeta
+-- FILTER (gapless list) – uses VKF_GetSlotMeta
 ----------------------------------------------------------------
 local function BuildFilteredSlots()
-  local out, total = {}, GetMerchantNumItems()
+  -- 🚫 Do NOT filter Buyback tab
+  if WL_IsBuyback() then
+    local out = {}
+    for slot = 1, GetBuybackNumItems() do
+      table.insert(out, slot)
+    end
+    return out
+  end
+
+  local out  = {}
+  local total = GetMerchantNumItems() or 0
+
   for slot = 1, total do
     local info = VKF_GetSlotMeta(slot)
     local link = info.link
@@ -1122,13 +1554,29 @@ local function BuildFilteredSlots()
       -- keep "empty" slots so paging works
       table.insert(out, slot)
     else
-      local isSet   = info.isSet
-      local isMount = info.isMount
-      local isPet   = info.isPet
-      local isToy   = info.isToy
+      local isSet           = info.isSet
+      local isMount         = info.isMount
+      local isPet           = info.isPet
+      local isToy           = info.isToy
+      local isTransmog      = info.isTransmog
+      local isKnownTransmog = info.isKnownTransmog
+
+	  ------------------------------------------------------------
+      -- Recompute "isGear" from scratch:
+      --  - not a set/mount/pet/toy
+      --  - equippable in a real gear slot
+      --  - passes our IsTransmogItem() check
+      ------------------------------------------------------------
+      local isGear = false
+      if not isSet and not isMount and not isPet and not isToy then
+        local _, _, _, _, _, _, _, _, equipLoc = GetItemInfo(link)
+        if equipLoc and GEAR_EQUIP_SLOTS[equipLoc] and IsTransmogItem(link) then
+          isGear = true
+        end
+      end
 
       ---------------------------------------------------------
-      -- Apply per-category rules (independent toggles)
+      -- Per-category rules
       ---------------------------------------------------------
       if isSet then
         if VKF_HideSets and info.isKnownSet then
@@ -1145,9 +1593,29 @@ local function BuildFilteredSlots()
         end
 
       elseif isPet then
-        if VKF_HidePets and info.isKnownPet then
-          hide = true
-        elseif VKF_SkipUnavail_Pets and info.isTempUnavailable then
+        -- Hide pets based on the "How many pets?" goal
+        if VKF_HidePets then
+          local goal = VKF_Settings and VKF_Settings.petGoal or 1
+          if goal ~= 1 and goal ~= 2 and goal ~= 3 then
+            goal = 1
+          end
+
+          local collected, totalPets = WL_ParseCollectedProgressFromTooltip(slot)
+          local atGoal = false
+
+          if collected and totalPets then
+            atGoal = WL_ShouldHidePetByGoal(collected, totalPets, goal)
+          else
+            -- fallback: just use known flag when we can't read progress
+            atGoal = info.isKnownPet
+          end
+
+          if atGoal then
+            hide = true
+          end
+        end
+
+        if not hide and VKF_SkipUnavail_Pets and info.isTempUnavailable then
           hide = true
         end
 
@@ -1157,8 +1625,19 @@ local function BuildFilteredSlots()
         elseif VKF_SkipUnavail_Toys and info.isTempUnavailable then
           hide = true
         end
-      end
 
+      ----------------------------------------------------------------
+      -- Normal transmog GEAR (actual armor/weapons only)
+      -- Only items with a real equip slot in GEAR_EQUIP_SLOTS count here.
+      ----------------------------------------------------------------
+      elseif isGear then
+        -- Only hide gear that is BOTH:
+        --  - affected by the /wlgear toggle
+        --  - actually known to the player
+        if VKF_HideGear and info.isKnownTransmog == true then
+          hide = true
+        end
+      end
       ---------------------------------------------------------
       -- Keep item visible if no filters apply
       ---------------------------------------------------------
@@ -1167,6 +1646,7 @@ local function BuildFilteredSlots()
       end
     end
   end
+
   return out
 end
 
@@ -1262,33 +1742,36 @@ local function VKF_BuildCategoryBreakdown()
     mounts = { total = 0, known = 0, count = 0 },
     pets   = { total = 0, known = 0, count = 0 },
     toys   = { total = 0, known = 0, count = 0 },
+    gear   = { total = 0, known = 0, count = 0 },
     countTotal = 0,
     countKnown = 0,
   }
 
+  -- Cost used for the breakdown:
+  -- * If the item uses an alt currency (Bronze / badges / tokens), return that amount.
+  -- * Otherwise, fall back to vendor gold price, converted from copper → GOLD.
   local function bronzeCost(slot)
-    local total = 0
+    -- 1) Alt-currency path (Bronze, Timewarped Badges, Ironpaw Tokens, etc.)
     local nAlt = GetMerchantItemCostInfo(slot) or 0
+    local altTotal = 0
     for i = 1, nAlt do
-      local _, amount, costLink = GetMerchantItemCostItem(slot, i)
-      if amount and amount > 0 and costLink then
-        local cid = C_CurrencyInfo and C_CurrencyInfo.GetCurrencyIDFromLink(costLink)
-        if cid and C_CurrencyInfo.GetCurrencyInfo then
-          local info = C_CurrencyInfo.GetCurrencyInfo(cid)
-          local nm = info and info.name or ""
-          if type(nm) == "string" then
-            local nmLower = nm:lower()
-            for _, token in ipairs(LOC.BRONZE_TOKENS or {}) do
-              if nmLower:find(token, 1, true) then
-                total = total + amount
-                break
-              end
-            end
-          end
-        end
+      local _, amount = GetMerchantItemCostItem(slot, i)
+      if amount and amount > 0 then
+        altTotal = altTotal + amount
       end
     end
-    return total
+    if altTotal > 0 then
+      return altTotal          -- keep token amounts as-is
+    end
+
+    -- 2) Pure gold cost: use vendor price but convert from copper → gold
+    local priceCopper = select(3, GetMerchantItemInfo(slot)) or 0
+    if priceCopper > 0 then
+      -- Round to nearest whole gold for nicer display
+      return math.floor(priceCopper / 10000 + 0.5)
+    end
+
+    return 0
   end
 
   local totalSlots = GetMerchantNumItems() or 0
@@ -1298,10 +1781,12 @@ local function VKF_BuildCategoryBreakdown()
     if link then
       local b = bronzeCost(slot) or 0
 
-      local isSet   = info.isSet
-      local isMount = info.isMount
-      local isPet   = info.isPet
-      local isToy   = info.isToy
+      local isSet           = info.isSet
+      local isMount         = info.isMount
+      local isPet           = info.isPet
+      local isToy           = info.isToy
+      local isTransmog      = info.isTransmog           -- NEW
+      local isKnownTransmog = info.isKnownTransmog      -- NEW
 
       local any, known = false, false
 
@@ -1340,6 +1825,19 @@ local function VKF_BuildCategoryBreakdown()
           out.toys.known = out.toys.known + b
           known = true
         end
+
+      ----------------------------------------------------------------
+      -- NEW: normal transmog gear/armor (transmog API only)
+      ----------------------------------------------------------------
+      elseif isTransmog then
+        any = true
+        out.gear.total = out.gear.total + b
+        out.gear.count = out.gear.count + 1
+
+        if isKnownTransmog then
+          out.gear.known = out.gear.known + b
+          known = true
+        end
       end
 
       if any then
@@ -1353,6 +1851,7 @@ local function VKF_BuildCategoryBreakdown()
 end
 
 -- --- Internal: write text into the mini panel using current stats (now includes Sets)
+-- --- Internal: write text into the mini panel using current stats (now includes Sets + Gear)
 local function VKF_FillMiniWithBreakdown(f)
   local stats = VKF_BuildCategoryBreakdown()
   local known = stats.countKnown or 0
@@ -1367,34 +1866,53 @@ local function VKF_FillMiniWithBreakdown(f)
 
   -- Build rows only for categories detected on this vendor
   local rows = {}
-  if stats.sets   and (stats.sets.count   or 0) > 0 then  table.insert(rows,   LOC.UI_SETS_TOTAL_FMT:format(fmt(stats.sets.known),   fmt(stats.sets.total)))   end
-  if stats.mounts and (stats.mounts.count or 0) > 0 then  table.insert(rows, LOC.UI_MOUNTS_TOTAL_FMT:format(fmt(stats.mounts.known), fmt(stats.mounts.total))) end
-  if stats.pets   and (stats.pets.count   or 0) > 0 then  table.insert(rows,   LOC.UI_PETS_TOTAL_FMT:format(fmt(stats.pets.known),   fmt(stats.pets.total)))   end
-  if stats.toys   and (stats.toys.count   or 0) > 0 then  table.insert(rows,   LOC.UI_TOYS_TOTAL_FMT:format(fmt(stats.toys.known),   fmt(stats.toys.total)))   end
-
-  -- Ensure the three line FontStrings exist
+    if stats.sets   and (stats.sets.count   or 0) > 0 then
+    table.insert(rows, LOC.UI_SETS_TOTAL_FMT:format(fmt(stats.sets.known),   fmt(stats.sets.total)))
+  end
+    if stats.gear   and (stats.gear.count   or 0) > 0 then
+    table.insert(rows, LOC.UI_GEAR_TOTAL_FMT:format(fmt(stats.gear.known), fmt(stats.gear.total)))
+  end
+  if stats.mounts and (stats.mounts.count or 0) > 0 then
+    table.insert(rows, LOC.UI_MOUNTS_TOTAL_FMT:format(fmt(stats.mounts.known), fmt(stats.mounts.total)))
+  end
+  if stats.pets   and (stats.pets.count   or 0) > 0 then
+    table.insert(rows, LOC.UI_PETS_TOTAL_FMT:format(fmt(stats.pets.known),   fmt(stats.pets.total)))
+  end
+  if stats.toys   and (stats.toys.count   or 0) > 0 then
+    table.insert(rows, LOC.UI_TOYS_TOTAL_FMT:format(fmt(stats.toys.known),   fmt(stats.toys.total)))
+  end
+  -- Ensure up to five line FontStrings exist
   if not f.line1 then f.line1 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall") end
   if not f.line2 then f.line2 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall") end
   if not f.line3 then f.line3 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall") end
+  if not f.line4 then f.line4 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall") end
+  if not f.line5 then f.line5 = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall") end
+
+  local lines = { f.line1, f.line2, f.line3, f.line4, f.line5 }
+  local used  = #rows
 
   -- Layout & fill
-  f.line1:ClearAllPoints(); f.line1:SetPoint("TOPLEFT", f.title, "BOTTOMLEFT", 0, -8)
-  local used = #rows
+  local prev = f.title
+  for i = 1, #lines do
+    local fs = lines[i]
+    fs:ClearAllPoints()
+    fs:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, (prev == f.title) and -8 or -6)
 
-  if used >= 1 then f.line1:SetText(rows[1]); f.line1:Show() else f.line1:Hide() end
+    if i <= used then
+      fs:SetText(rows[i])
+      fs:Show()
+    else
+      fs:Hide()
+    end
 
-  f.line2:ClearAllPoints(); f.line2:SetPoint("TOPLEFT", f.line1, "BOTTOMLEFT", 0, -6)
-  if used >= 2 then f.line2:SetText(rows[2]); f.line2:Show() else f.line2:Hide() end
-
-  f.line3:ClearAllPoints(); f.line3:SetPoint("TOPLEFT", (f.line2:IsShown() and f.line2 or f.line1), "BOTTOMLEFT", 0, -6)
-  if used >= 3 then f.line3:SetText(rows[3]); f.line3:Show() else f.line3:Hide() end
+    prev = fs
+  end
 
   -- Auto height
   local baseH, perRow = 54, 16
   local h = math.max(70, baseH + perRow * used)
   if f.SetHeight then f:SetHeight(h) end
 end
-
 
 
   ----------------------------------------------------------------
@@ -1536,8 +2054,11 @@ local function EnsureTotalsPanel()
   end)
   VKF_TotalsPanel:SetScript("OnSizeChanged", function(_, _, h) VKF_TotalsState.h = h end)
 
-  local title = VKF_TotalsPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  title:SetPoint("TOPLEFT", 8, -6); title:SetText(LOC.UI_UNLEARNED_TOTAL)
+local title = VKF_TotalsPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+title:SetPoint("TOPLEFT", 8, -6)
+title:SetText(LOC.UI_UNLEARNED_TOTAL)
+
+VKF_TotalsPanel.titleFS = title  -- NEW: keep a handle for later
 
   VKF_TotalsPanel.money = CreateFrame("Frame", nil, VKF_TotalsPanel, "SmallMoneyFrameTemplate")
   VKF_TotalsPanel.money:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
@@ -1547,6 +2068,33 @@ local function EnsureTotalsPanel()
     VKF_ShowMini(VKF_TotalsPanel)  -- reapply anchor with the same offsets
   end
 end)
+
+  -- Clicking the gold/silver/copper in the totals money line opens the breakdown
+  local function WireMoneyButton(btn)
+    if not btn then return end
+    btn:RegisterForClicks("AnyUp")
+
+    local oldOnClick = btn:GetScript("OnClick")
+    btn:SetScript("OnClick", function(self, mouseBtn)
+      if oldOnClick then
+        oldOnClick(self, mouseBtn)
+      end
+
+      if mouseBtn == "LeftButton" then
+        VKF_ToggleMini(VKF_TotalsPanel)
+        if PlaySound and SOUNDKIT and SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON then
+          PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+        end
+      end
+    end)
+  end
+
+  -- SmallMoneyFrameTemplate gives us GoldButton/SilverButton/CopperButton
+  WireMoneyButton(VKF_TotalsPanel.money.GoldButton)
+  WireMoneyButton(VKF_TotalsPanel.money.SilverButton)
+  WireMoneyButton(VKF_TotalsPanel.money.CopperButton)
+
+
   
   -- === BRONZE BUTTON (styled EXACTLY like AddLine rows) ===
   if not VKF_TotalsPanel.bronzeBtn then
@@ -1626,77 +2174,194 @@ local function AddLine(panel, iconFile, label, amount, yOff)
 end
 
 local function BuildTotals()
-  local totals = { money = 0, cur = {}, itm = {} }
+  local totals = {
+    money        = 0,
+    cur          = {},
+    itm          = {},
+    hasUnlearned = false, -- used to swap between "Unlearned Total" / "Completed Total" in the UI
+  }
+
   local totalSlots = GetMerchantNumItems()
+
+  local function GetPetCopiesNeeded(slot, info, link)
+    if not link then
+      return 0
+    end
+
+    local goal = tonumber(VKF_Settings and VKF_Settings.petGoal) or 1
+    if goal < 1 then
+      goal = 1
+    end
+
+    -- If we aren't doing anything fancy, fall back to old behavior.
+    if goal == 1 then
+      return info.isKnownPet and 0 or 1
+    end
+
+    local copiesOwned
+    local copiesMax
+
+    -- Try exact species -> journal count first
+    local speciesID = ItemTeachesPet(slot, link)
+    if type(speciesID) == "number"
+       and C_PetJournal
+       and C_PetJournal.GetNumCollectedInfo then
+      local n = C_PetJournal.GetNumCollectedInfo(speciesID)
+      if type(n) == "number" then
+        copiesOwned = n
+      end
+    end
+
+    -- Tooltip fallback for (x / y)
+    if not copiesOwned and VKF_SafeScannerSetMerchantItem then
+      if VKF_SafeScannerSetMerchantItem(slot) then
+        VKF_ScannerEachLine(function(L, R)
+          if copiesOwned then
+            return
+          end
+
+          local function check(fs)
+            local t = fs and fs:GetText()
+            if not t then
+              return
+            end
+            local a, b = t:match("%((%d+)%s*/%s*(%d+)%)")
+            if a then
+              copiesOwned = tonumber(a) or 0
+              copiesMax   = tonumber(b) or nil
+            end
+          end
+
+          check(L)
+          check(R)
+        end)
+      end
+    end
+
+    -- If we still don't know, just treat it as 0/1 like before
+    if not copiesOwned then
+      return info.isKnownPet and 0 or 1
+    end
+
+    -- Pet that only ever goes to 1/1 should ignore "3" goal etc.
+    if copiesMax and copiesMax > 0 and goal > copiesMax then
+      goal = copiesMax
+    end
+
+    local needed = goal - copiesOwned
+    if needed < 0 then
+      needed = 0
+    end
+
+    return needed
+  end
+
   for slot = 1, totalSlots do
     local info = VKF_GetSlotMeta(slot)
     local link = info.link
 
     local function CountThis()
-      if not link then return false end
+      if not link then
+        return 0
+      end
 
       if info.isSet then
-        if VKF_SkipUnavail_Sets and info.isTempUnavailable then return false end
-        return not info.isKnownSet
+        if VKF_SkipUnavail_Sets and info.isTempUnavailable then
+          return 0
+        end
+        return info.isKnownSet and 0 or 1
       end
 
       if info.isMount then
-        if VKF_SkipUnavail_Mounts and info.isTempUnavailable then return false end
-        return not info.isKnownMount
+        if VKF_SkipUnavail_Mounts and info.isTempUnavailable then
+          return 0
+        end
+        return info.isKnownMount and 0 or 1
       end
 
       if info.isPet then
-        if VKF_SkipUnavail_Pets and info.isTempUnavailable then return false end
-        return not info.isKnownPet
+        if VKF_SkipUnavail_Pets and info.isTempUnavailable then
+          return 0
+        end
+        return GetPetCopiesNeeded(slot, info, link)
       end
 
       if info.isToy then
-        if VKF_SkipUnavail_Toys and info.isTempUnavailable then return false end
-        return not info.isKnownToy
+        if VKF_SkipUnavail_Toys and info.isTempUnavailable then
+          return 0
+        end
+        return info.isKnownToy and 0 or 1
       end
-
-      return false
+  -- NEW: count normal transmog gear in totals
+  if info.isTransmog then
+    -- If the user asked to hide known gear, don't count it as "unlearned"
+    if VKF_HideGear and info.isKnownTransmog then
+      return 0
     end
 
-    if CountThis() then
+    -- 1 copy if unknown, 0 if already known
+    return info.isKnownTransmog and 0 or 1
+  end
+		
+
+      return 0
+    end
+
+    local copiesNeeded = CountThis()
+
+    if copiesNeeded > 0 then
+      totals.hasUnlearned = true
+
       local price = select(3, GetMerchantItemInfo(slot))
       if price and price > 0 then
-        totals.money = totals.money + price
+        totals.money = totals.money + (price * copiesNeeded)
       end
 
       local nAlt = GetMerchantItemCostInfo(slot) or 0
       for i = 1, nAlt do
         local tex, amount, costLink = GetMerchantItemCostItem(slot, i)
         if amount and amount > 0 and costLink then
+          amount = amount * copiesNeeded
+
           local curID = C_CurrencyInfo and C_CurrencyInfo.GetCurrencyIDFromLink(costLink)
-          if curID then
-            local key = "currency:"..curID
+
+          local key, name, icon
+
+          if curID and curID > 0 then
+            -- Normal currencies (Bronze, Timewarped Badge, etc.)
+            key = "currency:" .. curID
             local infoC = C_CurrencyInfo.GetCurrencyInfo(curID)
-            local entry = totals.cur[key] or {
-              name   = infoC and infoC.name or ("Currency "..curID),
-              icon   = infoC and infoC.iconFileID or tex,
-              amount = 0,
-            }
-            entry.amount = entry.amount + amount
-            totals.cur[key] = entry
+            name = infoC and infoC.name or ("Currency " .. curID)
+            icon = infoC and infoC.iconFileID or tex
           else
+            -- “Fake” currencies that are actually items (e.g. Mark of Honor)
             local itemID = GetItemInfoInstant(costLink)
             if itemID then
-              local key = "item:"..itemID
-              local name, _, _, _, _, _, _, _, _, icon = GetItemInfo(itemID)
-              local entry = totals.itm[key] or {
-                name   = name or ("Item "..itemID),
-                icon   = icon or tex,
-                amount = 0,
-              }
-              entry.amount = entry.amount + amount
-              totals.itm[key] = entry
+              key = "currency:item:" .. itemID
+              local itemName, _, _, _, _, _, _, _, _, itemIcon = GetItemInfo(itemID)
+              name = itemName or ("Item " .. itemID)
+              icon = itemIcon or tex
+            else
+              -- Total fallback if we can’t resolve anything
+              key  = "currency:0"
+              name = "Currency"
+              icon = tex
             end
           end
+
+          local entry = totals.cur[key] or {
+            name   = name,
+            icon   = icon,
+            amount = 0,
+          }
+
+          entry.amount = entry.amount + amount
+          totals.cur[key] = entry
         end
       end
     end
   end
+
   return totals
 end
 
@@ -1771,6 +2436,7 @@ local function UpdateTotalsUI()
     VKF_TotalsPanel:Hide()
     return
   end
+  
 
   ----------------------------------------------------------------
   -- Money line
@@ -2168,13 +2834,16 @@ local function PositionGearNearFilter()
   VKF_MenuButton:ClearAllPoints()
   local dd = VKF_FindFilterDropdown()
   if dd then
+    -- exact same anchor as before
     VKF_MenuButton:SetPoint("RIGHT", dd, "LEFT", -1, 0)
-    VKF_MenuButton:SetFrameStrata(dd:GetFrameStrata() or "DIALOG")
-    VKF_MenuButton:SetFrameLevel((dd:GetFrameLevel() or 20) + 5)
+
+    -- NEW: only z-order change
+    VKF_MenuButton:SetFrameStrata("HIGH")
+    VKF_MenuButton:SetFrameLevel(1000)
   else
     VKF_MenuButton:SetPoint("TOPRIGHT", MerchantFrame, "TOPRIGHT", -220, -6)
-    VKF_MenuButton:SetFrameStrata("DIALOG")
-    VKF_MenuButton:SetFrameLevel(MerchantFrame:GetFrameLevel() + 30)
+    VKF_MenuButton:SetFrameStrata("HIGH")
+    VKF_MenuButton:SetFrameLevel(1000)
   end
 end
 
@@ -2764,18 +3433,20 @@ local function WL_DumpVendor()
           meta = VKF_GetSlotMeta(slot)
         end
 
-        local isSet   = meta and meta.isSet   or false
-        local isMount = meta and meta.isMount or false
-        local isPet   = meta and meta.isPet   or false
-        local isToy   = meta and meta.isToy   or false
+        local isSet      = meta and meta.isSet      or false
+        local isMount    = meta and meta.isMount    or false
+        local isPet      = meta and meta.isPet      or false
+        local isToy      = meta and meta.isToy      or false
+        local isTransmog = meta and meta.isTransmog or false
 
         print(string.format(
-          "[%d] = { isSet=%s, isMount=%s, isPet=%s, isToy=%s },",
+          "[%d] = { isSet=%s, isMount=%s, isPet=%s, isToy=%s, isTransmog=%s },",
           itemID,
           tostring(isSet),
           tostring(isMount),
           tostring(isPet),
-          tostring(isToy)
+          tostring(isToy),
+          tostring(isTransmog)
         ))
       end
     end
@@ -2860,6 +3531,65 @@ VKF_LastSeenVersion = VKF_LastSeenVersion or "0.0.0"
 -- Most recent first.
 local VKF_CHANGELOG = {
 {
+    version = "1.4.1",
+    date    = "2025-12-4",
+    notes   = {
+      "Added notifications for incomplete ensembles: Raid Warning + sound + chat. Notifies once per login until the ensemble is actually complete.",
+      "New setting added: Enable (sound + popup), Silenced (chat only), or Disabled (no alerts).",
+      
+      "Improved currency detection for vendors outside Remix. Timewalking vendors now show correct totals in breakdowns, and filtering behaves more reliably across more vendor types.",
+            
+      "Various stability tweaks and smoothing: improved tooltip consistency, better filtering accuracy, and general backend refinement.",
+    },
+	
+		faq = {
+  "|cff40e0d0One Last Thing!|r",
+  "|cff8ccfffHappy Holidays!|r If you use Reddit, there's an announcement on /r/wowaddons you may want to check out!",
+        "Retail vendor improvements are coming soon, gear, recipes, and more filtering options are on the way!",
+	},
+},
+
+{
+    version = "1.4.0",
+    date    = "2025-11-30",
+    notes   = {
+      "Fixed the UI overlap issue caused by Dejunk. The gear icon no longer sits underneath other vendor addons, and this fix should generalize to most addons that anchor to the top left of the merchant frame.",
+      "Improved frame layering and anchor priority, What's Left should now reliably remain visible even when multiple vendor modifying addons are active.",
+      
+      "Resolved the Buyback tab breaking after filtering. You can swap between Merchant and Buyback pages without losing item visibility.",
+      "Buyback indexing has been corrected, no more invisible items, wrong ID lookup, or blocked purchase attempts.",
+      
+      "Smart Ensembles is now fully functional.",
+      "The addon now detects whether you are missing individual appearances inside ensembles even when Blizzard marks the set fully collected.",
+      "This allows proper filtering, correct 'What’s still missing?' decisions, and removes the need to wait for Blizzard tooltip flags to update.",
+      "Smart Ensembles will progressively expand to support edge cases, but the core logic is now complete and reliable for everyday use.",
+    },
+	faq = {
+  "|cff40e0d0One Last Thing!|r",
+  "|cff8ccfffHappy Holidays!|r If you use Reddit, there's an announcement on /r/wowaddons you may want to check out!",
+},
+},
+
+  {
+    version = "1.3.1",
+    date    = "2025-11-20",
+    notes   = {
+      "Added the new \"How Many Pets?\" setting.",
+      "Unlearned bronze totals now dynamically update based on how many pets you have selected.",
+      "UI scaling now correctly scales the Settings panel as well.",
+      "Updated localization for deDE, enUS, esMX, esES, frFR, itIT, ptBR, ruRU, koKR, zhCN, and zhTW.",
+      "Fixed pet breakdown not calculating for some locales.",
+    },
+faq = {
+  "|cff40e0d0Frequently Asked Questions|r",
+  "|cff8ccfffQ:|r Why does the addon hide some ensembles even if I'm missing appearances?",
+  "|cff8ccfffA:|r Blizzard marks certain ensembles as 'collected' even when they still contain unlearned pieces. What's Left follows Blizzard's flag for now, but a Smart Ensembles feature will be added to fix this in the next update.",
+  
+  "|cff8ccfffQ:|r Will you make this work with normal vendors? How about anniversary?",
+  "|cff8ccfffA:|r Yes to both of these, but I want to take it one step at a time to make sure I don't just rush out something buggy. If you'd like to help test builds before they're pushed to CurseForge, contact me! ",
+},
+  },
+{
     version = "1.3.0",
     date    = "2025-11-12",
     notes   = {
@@ -2933,7 +3663,7 @@ local VKF_CHANGELOG = {
 -- --- Helpers ---
 local function WL_GetVersion()
   local v = GetAddOnMetadata and GetAddOnMetadata(ADDON, "Version")
-  return (type(v)=="string" and v ~= "" and v) or "1.3.0"
+  return (type(v)=="string" and v ~= "" and v) or "1.4.1"
 end
 
 local function WL_IsNewerVersion(a, b) -- "1.1.0" > "1.0.0"
@@ -2997,8 +3727,9 @@ local function VKF_CreateChangelogEntry(parent, index, entry)
   bodyFS:SetPoint("RIGHT", -10, 0)
   bodyFS:SetJustifyH("LEFT")
   bodyFS:SetJustifyV("TOP")
-
   local lines = {}
+
+  -- bulleted notes
   for _, line in ipairs(entry.notes or {}) do
     if line == "— — — — —" then
       table.insert(lines, " ")                               -- spacer
@@ -3008,6 +3739,15 @@ local function VKF_CreateChangelogEntry(parent, index, entry)
       table.insert(lines, "• " .. line)
     end
   end
+
+  -- optional non-bulleted FAQ section
+  if entry.faq and #entry.faq > 0 then
+    table.insert(lines, " ")
+    for _, line in ipairs(entry.faq) do
+      table.insert(lines, line)      -- no "• "
+    end
+  end
+
   bodyFS:SetText(table.concat(lines, "\n"))
 
   container.header = header
@@ -3188,3 +3928,35 @@ WL_Changelog_Events:SetScript("OnEvent", function(_, ev, name)
     VKF_LastSeenVersion = cur
   end
 end)
+
+SLASH_WLDEBUGGEAR1 = "/wldebuggear"
+SlashCmdList.WLDEBUGGEAR = function()
+  for slot = 1, GetMerchantNumItems() do
+    local info = VKF_GetSlotMeta(slot)
+    if info.link then
+      print(string.format(
+        "Slot %d: %s  isTransmog=%s  known=%s",
+        slot,
+        info.link,
+        tostring(info.isTransmog),
+        tostring(info.isKnownTransmog)
+      ))
+    end
+  end
+end
+
+SLASH_WLGEAR1 = "/wlgear"
+SlashCmdList["WLGEAR"] = function()
+  -- Flip the session + saved flag
+  VKF_HideGear = not VKF_HideGear and true or false
+
+  local appName = (LOC and LOC.UI_APP_NAME) or "What's Left?"
+  local state   = VKF_HideGear and "ON" or "OFF"
+
+  print(("|cff66ccff%s|r: Hide Known Gear is now %s."):format(appName, state))
+
+  -- Force a repaint so the change is visible immediately
+  if HKA and HKA.Refresh then
+    HKA:Refresh()
+  end
+end
