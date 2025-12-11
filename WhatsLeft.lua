@@ -944,29 +944,6 @@ local function WL_IsAppearanceKnown(appearanceID)
   return false
 end
 
-local function WL_IsAppearanceKnown(appearanceID)
-  if not appearanceID then
-    return false
-  end
-  if not C_TransmogCollection or not C_TransmogCollection.GetAppearanceSources then
-    return false
-  end
-
-  local sources = C_TransmogCollection.GetAppearanceSources(appearanceID)
-  if not sources or #sources == 0 then
-    return false
-  end
-
-  for _, src in ipairs(sources) do
-    -- If ANY source for this appearance is collected, we treat the appearance as known.
-    if src.isCollected then
-      return true
-    end
-  end
-
-  return false
-end
-
 local function IsKnownSet(slot, link)
   if not link or not IsEnsemble(link, slot) then
     return false
@@ -3960,3 +3937,4 @@ SlashCmdList["WLGEAR"] = function()
     HKA:Refresh()
   end
 end
+
