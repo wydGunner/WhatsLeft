@@ -13,7 +13,7 @@
 ## Notes-ptBR: Oculta aparências, brinquedos, mascotes e montarias conhecidas; rastreia totais e progresso; interface leve.
 
 ## Author: Gunner
-## Version: 1.3.0
+## Version: 1.4.1
 ## SavedVariables: VKF_LastSeenVersion, VKF_FilterBehavior, VKF_ShowTotals, VKF_MenuPanelState, VKF_TotalsState
 ## IconTexture: Interface\AddOns\WhatsLeft\media\icon
 ## X-Category: Inventory
