@@ -3,7 +3,7 @@ local ADDON, NS = ...
 local LOC = GetLocaleTable()
 
 -- Make sure this exists somewhere early in your addon init:
-VKF_Settings = _G.VKF_Settings or { uiScale = 1.00, settingsPos = nil, petGoal = 1 }
+VKF_Settings = _G.VKF_Settings or { uiScale = 1.00, settingsPos = nil, petGoal = 1, ensembleNotify = "enabled"}
 _G.VKF_Settings = VKF_Settings
 
 -- Reusable: apply saved position or center
@@ -65,7 +65,7 @@ local function VKF_ShowSettings()
   title:SetPoint("TOPLEFT", 10, -10)
   local appTitle     = LOC.UI_APP_TITLE or "What's Left?"
 local settingsWord = LOC.UI_SETTINGS_TITLE or "Settings"
-title:SetText( ("|cff8cccff%s|r  v1.3.0 %s"):format(appTitle, settingsWord) )
+title:SetText( ("|cff8cccff%s|r  v1.4.1 %s"):format(appTitle, settingsWord) )
 
   f:SetMovable(true)
   f:EnableMouse(true)
@@ -168,8 +168,8 @@ title:SetText( ("|cff8cccff%s|r  v1.3.0 %s"):format(appTitle, settingsWord) )
   line1:SetHeight(1)
   line1:SetPoint("TOPLEFT", totalsHint, "BOTTOMLEFT", 0, -8)
   line1:SetPoint("TOPRIGHT", -16, 0)
-  -------------------------------------------------
-  -- SECTION 2: How many pets? (middle, greyed out)
+    -------------------------------------------------
+  -- SECTION 2: How many pets? (middle)
   -------------------------------------------------
   VKF_Settings.petGoal = (VKF_Settings.petGoal == 1 or VKF_Settings.petGoal == 2 or VKF_Settings.petGoal == 3)
     and VKF_Settings.petGoal or 1
@@ -182,18 +182,21 @@ title:SetText( ("|cff8cccff%s|r  v1.3.0 %s"):format(appTitle, settingsWord) )
 
   local hint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   hint:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -2)
- hint:SetText(LOC.UI_SETTINGS_PETS_HINT1)
-  hint:SetTextColor(0.70, 0.70, 0.70, 1)
+  --hint:SetText(LOC.UI_SETTINGS_PETS_HINT1)
+  hint:SetTextColor(unpack(CLR_HINT))
   WrapFS(hint)
 
   local hint2 = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   hint2:SetPoint("TOPLEFT", hint, "BOTTOMLEFT", 0, -1)
   hint2:SetText(LOC.UI_SETTINGS_PETS_HINT2)
-  hint2:SetTextColor(0.70, 0.70, 0.70, 1)
+  hint2:SetTextColor(unpack(CLR_HINT))
   WrapFS(hint2)
 
+   -------------------------------------------------
+  -- Button that opens our own dropdown menu
+  -------------------------------------------------
   local ddBtn = CreateFrame("Button", "$parentPetGoalDD", f, "BackdropTemplate")
-  ddBtn:SetSize(140, 26)
+  ddBtn:SetSize(80, 24)
   ddBtn:SetPoint("TOPLEFT", hint2, "BOTTOMLEFT", -2, -6)
   ddBtn:SetBackdrop({
     bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
@@ -204,35 +207,247 @@ title:SetText( ("|cff8cccff%s|r  v1.3.0 %s"):format(appTitle, settingsWord) )
   ddBtn:SetBackdropColor(unpack(CLR_BOX_BG))
   ddBtn:SetBackdropBorderColor(unpack(CLR_BOX_EDGE))
 
+  -- value text
   ddBtn.text = ddBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
   ddBtn.text:SetPoint("LEFT", 10, 0)
-  ddBtn.text:SetTextColor(0.55, 0.55, 0.55, 1)
-  ddBtn.text:SetText(tostring(VKF_Settings.petGoal))
+  ddBtn.text:SetTextColor(0.92, 0.92, 0.92, 1)
+  ddBtn.text:SetText(tostring(VKF_Settings.petGoal or 1))
 
+  -- dropdown arrow so it reads as a dropdown
   ddBtn.arrow = ddBtn:CreateTexture(nil, "ARTWORK")
   ddBtn.arrow:SetTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up")
-  ddBtn.arrow:SetSize(16, 16)
-  ddBtn.arrow:SetPoint("RIGHT", -8, 0)
-  ddBtn.arrow:SetAlpha(0.35)
+  ddBtn.arrow:SetSize(14, 14)
+  ddBtn.arrow:SetPoint("RIGHT", -6, 0)
+  ddBtn.arrow:SetAlpha(0.9)
 
+  -- hover highlight
   ddBtn.hl = ddBtn:CreateTexture(nil, "OVERLAY")
   ddBtn.hl:SetColorTexture(CLR_HOVER[1], CLR_HOVER[2], CLR_HOVER[3], 0.10)
   ddBtn.hl:SetAllPoints()
   ddBtn.hl:Hide()
 
-  ddBtn:SetAlpha(0.55)
-  ddBtn:Disable()
-
   ddBtn:SetScript("OnEnter", function(self)
     ddBtn.hl:Show()
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText(LOC.UI_SETTINGS_COMING_SOON_HINT or LOC.UI_COMING_SOON, 1, 1, 1, true)
+    GameTooltip:SetText(
+      LOC.UI_SETTINGS_PETS_HINT1 .. "\n" ..
+      (LOC.UI_SETTINGS_PETS_HINT2 or ""),
+      1, 1, 1, true
+    )
   end)
+
   ddBtn:SetScript("OnLeave", function()
     ddBtn.hl:Hide()
     GameTooltip:Hide()
   end)
 
+
+  -------------------------------------------------
+  -- Custom dropdown panel underneath the button
+  -------------------------------------------------
+  local petGoalMenu = CreateFrame("Frame", "$parentPetGoalMenu", f, "BackdropTemplate")
+  petGoalMenu:SetSize(ddBtn:GetWidth(), 3 * 20 + 6) -- 3 options
+  petGoalMenu:SetPoint("TOPLEFT", ddBtn, "BOTTOMLEFT", 0, -2)
+  petGoalMenu:SetBackdrop({
+    bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
+    edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets   = { left = 3, right = 3, top = 3, bottom = 3 }
+  })
+  petGoalMenu:SetBackdropColor(0, 0, 0, 1)
+  petGoalMenu:SetBackdropBorderColor(unpack(CLR_BOX_EDGE))
+    petGoalMenu:SetFrameStrata("TOOLTIP")
+  petGoalMenu:SetFrameLevel(f:GetFrameLevel() + 10)
+
+  petGoalMenu:Hide()
+  petGoalMenu:SetFrameStrata("DIALOG")
+
+  local options = { 1, 2, 3 }
+  for i, value in ipairs(options) do
+    local opt = CreateFrame("Button", nil, petGoalMenu, "BackdropTemplate")
+    opt:SetSize(petGoalMenu:GetWidth() - 6, 20)
+    opt:SetPoint("TOPLEFT", 3, -3 - (i - 1) * 20)
+
+    local txt = opt:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    txt:SetPoint("LEFT", 4, 0)
+    txt:SetText(tostring(value))
+    txt:SetTextColor(0.92, 0.92, 0.92, 1)
+    opt.text = txt
+
+    local hl = opt:CreateTexture(nil, "BACKGROUND")
+    hl:SetColorTexture(CLR_HOVER[1], CLR_HOVER[2], CLR_HOVER[3], 0.15)
+    hl:SetAllPoints()
+    hl:Hide()
+    opt.hl = hl
+
+    opt:SetScript("OnEnter", function(self)
+      self.hl:Show()
+    end)
+    opt:SetScript("OnLeave", function(self)
+      self.hl:Hide()
+    end)
+
+    opt:SetScript("OnClick", function(self)
+      VKF_Settings.petGoal = value
+      ddBtn.text:SetText(tostring(value))
+      petGoalMenu:Hide()
+
+      if SOUNDKIT and SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON then
+        PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+      end
+    end)
+  end
+
+  ddBtn:SetScript("OnClick", function(self)
+    if petGoalMenu:IsShown() then
+      petGoalMenu:Hide()
+    else
+      petGoalMenu:Show()
+    end
+  end)
+
+  -------------------------------------------------
+  -- SECTION 3: Ensemble Notifications
+  -------------------------------------------------
+
+  -- sanitize saved value
+  VKF_Settings.ensembleNotify = VKF_Settings.ensembleNotify or "enabled"
+  if VKF_Settings.ensembleNotify ~= "enabled"
+    and VKF_Settings.ensembleNotify ~= "silenced"
+    and VKF_Settings.ensembleNotify ~= "disabled" then
+    VKF_Settings.ensembleNotify = "enabled"
+  end
+
+local ensHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+-- Align vertically with "How many pets?" by using line1 like the label does
+-- label:SetPoint("TOPLEFT", line1, "BOTTOMLEFT", 0, -8)
+ensHeader:SetPoint("TOPLEFT", line1, "BOTTOMLEFT", 122, -8)  -- tweak 210 as needed
+ensHeader:SetText(LOC.ENS_NOTIFS)
+ensHeader:SetTextColor(unpack(BABY_BLUE))
+WrapFS(ensHeader)
+
+  local ensHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  ensHint:SetPoint("TOPLEFT", ensHeader, "BOTTOMLEFT", 0, -2)
+
+  ensHint:SetTextColor(unpack(CLR_HINT))
+  WrapFS(ensHint)
+
+  -- Dropdown button
+  local ensDD = CreateFrame("Button", "$parentEnsembleNotifyDD", f, "BackdropTemplate")
+  ensDD:SetSize(120, 24)
+  ensDD:SetPoint("TOPLEFT", ensHint, "BOTTOMLEFT", -2, -6)
+  ensDD:SetBackdrop({
+    bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
+    edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets   = { left = 3, right = 3, top = 3, bottom = 3 }
+  })
+  ensDD:SetBackdropColor(unpack(CLR_BOX_BG))
+  ensDD:SetBackdropBorderColor(unpack(CLR_BOX_EDGE))
+
+  ensDD.text = ensDD:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  ensDD.text:SetPoint("LEFT", 10, 0)
+  ensDD.text:SetTextColor(0.92, 0.92, 0.92, 1)
+
+  ensDD.arrow = ensDD:CreateTexture(nil, "ARTWORK")
+  ensDD.arrow:SetTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up")
+  ensDD.arrow:SetSize(14, 14)
+  ensDD.arrow:SetPoint("RIGHT", -6, 0)
+  ensDD.arrow:SetAlpha(0.9)
+
+  ensDD.hl = ensDD:CreateTexture(nil, "OVERLAY")
+  ensDD.hl:SetColorTexture(CLR_HOVER[1], CLR_HOVER[2], CLR_HOVER[3], 0.10)
+  ensDD.hl:SetAllPoints()
+  ensDD.hl:Hide()
+
+local ENSEMBLE_OPTIONS = {
+    { value = "enabled",  label = LOC.ENS_OPT_ENABLED  }, -- Sound + popups + chat
+    { value = "silenced", label = LOC.ENS_OPT_SILENCED }, -- Chat only
+    { value = "disabled", label = LOC.ENS_OPT_DISABLED }, -- Off
+}
+
+  local function EnsembleGetLabel(value)
+    for _, opt in ipairs(ENSEMBLE_OPTIONS) do
+      if opt.value == value then
+        return opt.label
+      end
+    end
+    return "Enabled"
+  end
+
+  ensDD.text:SetText(EnsembleGetLabel(VKF_Settings.ensembleNotify))
+
+ensDD:SetScript("OnEnter", function(self)
+  ensDD.hl:Show()
+  GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+  GameTooltip:SetText(LOC.ENS_TOOLTIP, 1, 1, 1, true)
+end)
+
+  ensDD:SetScript("OnLeave", function()
+    ensDD.hl:Hide()
+    GameTooltip:Hide()
+  end)
+
+  -- Dropdown menu
+  local ensMenu = CreateFrame("Frame", "$parentEnsembleNotifyMenu", f, "BackdropTemplate")
+  ensMenu:SetSize(ensDD:GetWidth(), #ENSEMBLE_OPTIONS * 20 + 6)
+  ensMenu:SetPoint("TOPLEFT", ensDD, "BOTTOMLEFT", 0, -2)
+  ensMenu:SetBackdrop({
+    bgFile   = "Interface/Tooltips/UI-Tooltip-Background",
+    edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets   = { left = 3, right = 3, top = 3, bottom = 3 }
+  })
+  ensMenu:SetBackdropColor(0, 0, 0, 1)
+  ensMenu:SetBackdropBorderColor(unpack(CLR_BOX_EDGE))
+  ensMenu:SetFrameStrata("DIALOG")
+  ensMenu:SetFrameLevel(f:GetFrameLevel() + 10)
+  ensMenu:Hide()
+
+  for i, optData in ipairs(ENSEMBLE_OPTIONS) do
+    local opt = CreateFrame("Button", nil, ensMenu, "BackdropTemplate")
+    opt:SetSize(ensMenu:GetWidth() - 6, 20)
+    opt:SetPoint("TOPLEFT", 3, -3 - (i - 1) * 20)
+
+    local txt = opt:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    txt:SetPoint("LEFT", 4, 0)
+    txt:SetText(optData.label)
+    txt:SetTextColor(0.92, 0.92, 0.92, 1)
+    opt.text = txt
+
+    local hl = opt:CreateTexture(nil, "BACKGROUND")
+    hl:SetColorTexture(CLR_HOVER[1], CLR_HOVER[2], CLR_HOVER[3], 0.15)
+    hl:SetAllPoints()
+    hl:Hide()
+    opt.hl = hl
+
+    opt:SetScript("OnEnter", function(self) self.hl:Show() end)
+    opt:SetScript("OnLeave", function(self) self.hl:Hide() end)
+
+    opt:SetScript("OnClick", function()
+      VKF_Settings.ensembleNotify = optData.value
+      ensDD.text:SetText(optData.label)
+      ensMenu:Hide()
+
+      if SOUNDKIT and SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON then
+        PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+      end
+    end)
+  end
+
+  ensDD:SetScript("OnClick", function()
+    if ensMenu:IsShown() then
+      ensMenu:Hide()
+    else
+      ensMenu:Show()
+    end
+  end)
+
+
+
+  -------------------------------------------------
+  -- Divider line under the control (layout unchanged)
+  -------------------------------------------------
   local line2 = f:CreateTexture(nil, "BACKGROUND")
   line2:SetColorTexture(unpack(CLR_LINE))
   line2:SetHeight(1)
